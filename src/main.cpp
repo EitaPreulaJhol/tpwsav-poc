@@ -521,11 +521,11 @@ static int RunBody() {
         ULONG64 ntPhys = WindowVirtToPhys(systemCr3, kOffsets.NtoskrnlBase);
         if (ntPhys) {
             USHORT mz = (USHORT)WindowRead32(ntPhys);
-            printf("[%c] Window: %s\n", mz == 0x5A4D ? '+' : '-',
-                   mz == 0x5A4D ? "LIVE" : "FAILED");
+            printf("[%c] VirtToPhys: %s\n", mz == 0x5A4D ? '+' : '-',
+                   mz == 0x5A4D ? "OKAY" : "FAILED");
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        printf("[-] Window: FAILED\n");
+        printf("[-] VirtToPhys: FAILED\n");
     }
 
     {

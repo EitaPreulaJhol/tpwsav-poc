@@ -1,17 +1,29 @@
 #include <windows.h>
+#include <psapi.h>
 #include <stdio.h>
 #include "syscalls.h"
 #include "symbols.h"
 #include "physmem.h"
 #include "window.h"
 
+#pragma comment(lib, "psapi.lib")
+
 #define MAX_CHUNKS 256
 #define CHUNK_SIZE 0x40000000ULL
+
+// Which fields of a VadPatch were really read/patched, so RestorePhysWindow()
+// never writes a stale zero back into a field the spoof never touched.
+#define VP_FLAGS      0x01
+#define VP_STARTVPN   0x02
+#define VP_ENDVPN     0x04
+#define VP_STARTHIGH  0x08
+#define VP_ENDHIGH    0x10
 
 struct VadPatch {
     ULONG64 flagsVA, startVpnVA, endVpnVA, startHighVA, endHighVA;
     ULONG origFlags, origStartVpn, origEndVpn;
     BYTE origStartHigh, origEndHigh;
+    BYTE valid;
 };
 
 static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrl);
@@ -26,6 +38,11 @@ static ULONG64 g_VirtualSizeOrig = 0;
 struct PhysChunk {
     ULONG64 physBase;
     BYTE* mappedAddr;
+    ULONG64 mapSize;
+    // true once every page of the view is present, i.e. the window can be read
+    // and written without ever taking another page fault. Only those chunks may
+    // have their VAD truncated - see PrefaultWindow().
+    bool resident;
 };
 
 static PhysChunk g_Chunks[MAX_CHUNKS] = {};
@@ -39,6 +56,108 @@ static inline BYTE* ResolvePhysAddr(ULONG64 physAddr) {
         return NULL;
     ULONG64 offset = physAddr - g_Chunks[chunkIdx].physBase;
     return g_Chunks[chunkIdx].mappedAddr + offset;
+}
+
+// Read a byte of the window, trapping a fault. Kept in its own function so the
+// __try block is not mixed with C++ objects that need unwinding (C2712).
+static bool TouchWindowPage(BYTE* page) {
+    __try {
+        volatile BYTE* p = page;
+        (void)*p;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+// Write a byte back unchanged, trapping a fault. Used to verify - not to
+// pre-fault - that the mapping is writable: see PrefaultWindow().
+static bool ProbeWindowWrite(BYTE* page) {
+    __try {
+        BYTE v = *page;
+        *page = v;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+// Pre-fault the whole window before any VAD is spoofed.
+//
+// This is the hard requirement for the VAD spoof to be survivable. Truncating a
+// VAD does not stop the kernel from keeping the section mapped, but it *does*
+// remove the address range from the VAD tree, and a user-mode page fault is
+// resolved through that tree: MiFindVad() finds nothing past the new end and
+// the access comes back as STATUS_ACCESS_VIOLATION. The first physical read
+// more than 64 KiB into a 1 GiB chunk after the spoof therefore kills the
+// process - silently, because nothing in the tool has a handler there.
+//
+// Faulting every page in first makes the view need no further faults, so the
+// truncated VADs only cost visibility (VirtualQuery) and nothing else.
+//
+// The touch is a read, never a write: these are live physical pages (kernel
+// images, pools, DMA targets) and writing a byte back could clobber a
+// concurrent update. Reads leave the contents untouched. A section-mapped
+// physical page gets a present, section-writable PTE on a read fault, so the
+// later WindowWrite* calls still work; ProbeWindowWrite() samples that.
+static void PrefaultWindow() {
+    ULONGLONG want = 0;
+    for (ULONG i = 0; i < g_ChunkCount; i++)
+        if (g_Chunks[i].mappedAddr) want += g_Chunks[i].mapSize;
+
+    // Commit charge for the whole window is needed up front. If it cannot be
+    // had, skip the spoof rather than take the guaranteed STATUS_ACCESS_VIOLATION.
+    ULONGLONG available = 0;
+    PERFORMANCE_INFORMATION perf = { sizeof(perf) };
+    if (GetPerformanceInfo(&perf, sizeof(perf)) && perf.CommitLimit > perf.CommitTotal)
+        available = (ULONGLONG)(perf.CommitLimit - perf.CommitTotal);
+
+    const ULONGLONG slack = 512ULL << 20;
+    if (available && want + slack > available) {
+        printf("[-] Pre-faulting the window needs %llu MB of commit charge, only %llu MB free\n",
+               want >> 20, available >> 20);
+        printf("[-] VAD spoof disabled (leaving the VADs intact instead of faulting)\n");
+        return;
+    }
+
+    ULONGLONG t0 = GetTickCount64();
+    printf("[*] Pre-faulting window (%llu MB, this takes a moment)...\n", want >> 20);
+
+    const ULONGLONG kProbeStride = 0x4000000ULL; // 64 MiB
+    ULONG resident = 0;
+
+    for (ULONG i = 0; i < g_ChunkCount; i++) {
+        PhysChunk* c = &g_Chunks[i];
+        if (!c->mappedAddr) continue;
+        c->resident = false;
+
+        bool ok = true;
+        for (ULONGLONG off = 0; off < c->mapSize; off += 0x1000) {
+            if (!TouchWindowPage(c->mappedAddr + off)) {
+                printf("[-] Chunk %u could not be faulted in at +0x%llX, leaving it unspoofed\n",
+                       i, off);
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+
+        // Confirm the mapping is writable while a page fault can still be taken.
+        for (ULONGLONG off = 0; off < c->mapSize; off += kProbeStride) {
+            if (!ProbeWindowWrite(c->mappedAddr + off)) {
+                printf("[-] Chunk %u is not writable, leaving it unspoofed\n", i);
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            c->resident = true;
+            resident++;
+        }
+    }
+
+    printf("[+] Window pre-faulted: %u/%u chunks resident (%llu ms)\n",
+           resident, g_ChunkCount, GetTickCount64() - t0);
 }
 
 bool SetupPhysWindow(HANDLE device, SyscallTable* sc, ULONG64 systemCr3, KernelOffsets* offsets) {
@@ -92,11 +211,15 @@ bool SetupPhysWindow(HANDLE device, SyscallTable* sc, ULONG64 systemCr3, KernelO
         if (!mapped) {
             g_Chunks[i].physBase = physBase;
             g_Chunks[i].mappedAddr = NULL;
+            g_Chunks[i].mapSize = 0;
+            g_Chunks[i].resident = false;
             continue;
         }
 
         g_Chunks[i].physBase = mapStart;
         g_Chunks[i].mappedAddr = (BYTE*)mapped;
+        g_Chunks[i].mapSize = mapSize;
+        g_Chunks[i].resident = false;
         g_ChunkCount = i + 1;
         g_TotalMapped += mapSize;
     }
@@ -112,17 +235,22 @@ bool SetupPhysWindow(HANDLE device, SyscallTable* sc, ULONG64 systemCr3, KernelO
     printf("[+] Window: %llu MB in %u chunks\n", g_TotalMapped / (1024 * 1024), g_ChunkCount);
 
     // verify
+    bool any = false;
     for (ULONG i = 0; i < g_ChunkCount; i++) {
-        if (g_Chunks[i].mappedAddr) {
-            BYTE* test = ResolvePhysAddr(g_Chunks[i].physBase + 0x1000);
-            if (test) {
-                SetPhysWindowMode(true);
-                printf("[+] Window verified\n");
-                return true;
-            }
+        if (g_Chunks[i].mappedAddr && ResolvePhysAddr(g_Chunks[i].physBase + 0x1000)) {
+            any = true;
+            break;
         }
     }
-    return false;
+    if (!any) return false;
+
+    SetPhysWindowMode(true);
+    printf("[+] Window verified\n");
+
+    // Must happen before SpoofWindowVADs(), which depends on it.
+    PrefaultWindow();
+
+    return true;
 }
 
 ULONG64 WindowRead64(ULONG64 physAddr) {
@@ -165,17 +293,28 @@ void RestorePhysWindow() {
     // been paged out and remapped since the spoof, so cached PAs can be stale.
     for (ULONG i = 0; i < g_VadPatchCount; i++) {
         VadPatch* p = &g_VadPatches[i];
+        if (!p->valid) continue;
         ULONG64 pa;
-        pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->flagsVA) : 0;
-        if (pa) WindowWriteBuffer(pa, &p->origFlags, sizeof(p->origFlags));
-        pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->startVpnVA) : 0;
-        if (pa) WindowWriteBuffer(pa, &p->origStartVpn, sizeof(p->origStartVpn));
-        pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->endVpnVA) : 0;
-        if (pa) WindowWriteBuffer(pa, &p->origEndVpn, sizeof(p->origEndVpn));
-        pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->startHighVA) : 0;
-        if (pa) WindowWriteBuffer(pa, &p->origStartHigh, 1);
-        pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->endHighVA) : 0;
-        if (pa) WindowWriteBuffer(pa, &p->origEndHigh, 1);
+        if (p->valid & VP_FLAGS) {
+            pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->flagsVA) : 0;
+            if (pa) WindowWriteBuffer(pa, &p->origFlags, sizeof(p->origFlags));
+        }
+        if (p->valid & VP_STARTVPN) {
+            pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->startVpnVA) : 0;
+            if (pa) WindowWriteBuffer(pa, &p->origStartVpn, sizeof(p->origStartVpn));
+        }
+        if (p->valid & VP_ENDVPN) {
+            pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->endVpnVA) : 0;
+            if (pa) WindowWriteBuffer(pa, &p->origEndVpn, sizeof(p->origEndVpn));
+        }
+        if (p->valid & VP_STARTHIGH) {
+            pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->startHighVA) : 0;
+            if (pa) WindowWriteBuffer(pa, &p->origStartHigh, 1);
+        }
+        if (p->valid & VP_ENDHIGH) {
+            pa = g_SpoofCr3 ? WindowVirtToPhys(g_SpoofCr3, p->endHighVA) : 0;
+            if (pa) WindowWriteBuffer(pa, &p->origEndHigh, 1);
+        }
     }
     g_VadPatchCount = 0;
 
@@ -186,6 +325,17 @@ void RestorePhysWindow() {
     }
 
     printf("[+] VAD patches restored\n");
+}
+
+ULONG WindowVadPatchCount() {
+    return g_VadPatchCount;
+}
+
+ULONG WindowResidentChunks() {
+    ULONG n = 0;
+    for (ULONG i = 0; i < g_ChunkCount; i++)
+        if (g_Chunks[i].mappedAddr && g_Chunks[i].resident) n++;
+    return n;
 }
 
 ULONG64 WindowVirtToPhys(ULONG64 cr3, ULONG64 virtualAddr) {
@@ -220,9 +370,10 @@ static ULONG64 SpoofReadPtr(HANDLE dev, SyscallTable* sc, ULONG64 cr3, ULONG64 v
 static void WalkAndSpoofVAD(
     HANDLE dev, SyscallTable* sc,
     ULONG64 nodeVA, ULONG64 cr3, KernelOffsets* offsets,
-    int depth, int* spoofed
+    int depth, int* spoofed, ULONG64* visited
 ) {
     if (!nodeVA || depth > 40 || *spoofed >= (int)g_ChunkCount) return;
+    if (++*visited > 100000) return; // a cyclic/hostile VAD tree must not hang us
 
     ULONG64 nodePA = VirtToPhys(dev, sc, cr3, nodeVA);
     if (!nodePA) return;
@@ -242,57 +393,74 @@ static void WalkAndSpoofVAD(
 
         for (ULONG i = 0; i < g_ChunkCount; i++) {
             if (!g_Chunks[i].mappedAddr) continue;
+            // A chunk is only safe to hide when its pages are all present: after
+            // the truncation the kernel can no longer resolve a fault for it.
+            if (!g_Chunks[i].resident) continue;
+
             ULONG64 chunkVA = (ULONG64)g_Chunks[i].mappedAddr;
-            if (chunkVA >= regionStart && chunkVA < regionStart + regionSize
-                && regionSize > 0x100000 && g_VadPatchCount < MAX_VAD_PATCHES) {
+            ULONG64 chunkEnd = chunkVA + g_Chunks[i].mapSize - 1;
+            if (regionSize <= 0x100000) continue;
+            // the VAD must cover the *whole* view, not just its first page,
+            // otherwise the other views sharing that VAD lose their faults
+            if (chunkVA < regionStart || chunkEnd >= regionStart + regionSize) continue;
+            if (g_VadPatchCount >= MAX_VAD_PATCHES) break;
 
-                VadPatch* p = &g_VadPatches[g_VadPatchCount];
-                p->flagsVA = nodeVA + offsets->VadFlags;
-                p->startVpnVA = nodeVA + offsets->VadStartingVpn;
-                p->endVpnVA = nodeVA + offsets->VadEndingVpn;
-                p->startHighVA = nodeVA + offsets->VadStartingVpnHigh;
-                p->endHighVA = nodeVA + offsets->VadEndingVpnHigh;
+            VadPatch* p = &g_VadPatches[g_VadPatchCount];
+            p->flagsVA = nodeVA + offsets->VadFlags;
+            p->startVpnVA = nodeVA + offsets->VadStartingVpn;
+            p->endVpnVA = nodeVA + offsets->VadEndingVpn;
+            p->startHighVA = nodeVA + offsets->VadStartingVpnHigh;
+            p->endHighVA = nodeVA + offsets->VadEndingVpnHigh;
+            p->valid = 0;
 
-                ULONG64 flagsPA = VirtToPhys(dev, sc, cr3, p->flagsVA);
-                ULONG64 startHighPA = VirtToPhys(dev, sc, cr3, p->startHighVA);
-                ULONG64 endHighPA = VirtToPhys(dev, sc, cr3, p->endHighVA);
+            ULONG64 flagsPA = VirtToPhys(dev, sc, cr3, p->flagsVA);
+            ULONG64 startHighPA = VirtToPhys(dev, sc, cr3, p->startHighVA);
+            ULONG64 endHighPA = VirtToPhys(dev, sc, cr3, p->endHighVA);
 
-                // skip secured VADs
-                if (flagsPA) {
-                    ULONG secFlags = PhysRead32(dev, sc, flagsPA);
-                    if (secFlags & 4u) break;
-                }
-
-                if (flagsPA) p->origFlags = PhysRead32(dev, sc, flagsPA);
-                p->origStartVpn = startVpn;
-                p->origEndVpn = endVpn;
-                if (startHighPA) PhysReadBuffer(dev, sc, startHighPA, &p->origStartHigh, 1);
-                if (endHighPA) PhysReadBuffer(dev, sc, endHighPA, &p->origEndHigh, 1);
-
-                if (flagsPA) {
-                    ULONG flags = p->origFlags;
-                    flags |= (1u << 20);
-                    flags &= ~(1u << 25);
-                    PhysWriteBuffer(dev, sc, flagsPA, &flags, sizeof(flags));
-                }
-
-                ULONG fakeEnd = startVpn + 0x10;
-                PhysWriteBuffer(dev, sc, endVpnPA, &fakeEnd, sizeof(fakeEnd));
-                if (endHighPA) {
-                    BYTE z = 0;
-                    PhysWriteBuffer(dev, sc, endHighPA, &z, 1);
-                }
-
-                g_VadPatchCount++;
-                (*spoofed)++;
-                break;
+            // skip secured VADs - this node must be skipped, not just this chunk
+            if (flagsPA) {
+                ULONG secFlags = PhysRead32(dev, sc, flagsPA);
+                if (secFlags & 4u) goto recurse;
             }
+
+            p->origStartVpn = startVpn;
+            p->valid |= VP_STARTVPN;
+            p->origEndVpn = endVpn;
+            p->valid |= VP_ENDVPN;
+            if (startHighPA) {
+                PhysReadBuffer(dev, sc, startHighPA, &p->origStartHigh, 1);
+                p->valid |= VP_STARTHIGH;
+            }
+            if (endHighPA) {
+                PhysReadBuffer(dev, sc, endHighPA, &p->origEndHigh, 1);
+                p->valid |= VP_ENDHIGH;
+            }
+
+            if (flagsPA) {
+                p->origFlags = PhysRead32(dev, sc, flagsPA);
+                p->valid |= VP_FLAGS;
+                ULONG flags = p->origFlags;
+                flags |= (1u << 20);
+                flags &= ~(1u << 25);
+                PhysWriteBuffer(dev, sc, flagsPA, &flags, sizeof(flags));
+            }
+
+            ULONG fakeEnd = startVpn + 0x10;
+            PhysWriteBuffer(dev, sc, endVpnPA, &fakeEnd, sizeof(fakeEnd));
+            if (endHighPA) {
+                BYTE z = 0;
+                PhysWriteBuffer(dev, sc, endHighPA, &z, 1);
+            }
+
+            g_VadPatchCount++;
+            (*spoofed)++;
+            break;
         }
     }
 
 recurse:
-    WalkAndSpoofVAD(dev, sc, left, cr3, offsets, depth + 1, spoofed);
-    WalkAndSpoofVAD(dev, sc, right, cr3, offsets, depth + 1, spoofed);
+    WalkAndSpoofVAD(dev, sc, left, cr3, offsets, depth + 1, spoofed, visited);
+    WalkAndSpoofVAD(dev, sc, right, cr3, offsets, depth + 1, spoofed, visited);
 }
 
 bool SpoofWindowVADs(HANDLE device, SyscallTable* sc, ULONG64 systemCr3, KernelOffsets* offsets) {
@@ -335,8 +503,12 @@ bool SpoofWindowVADs(HANDLE device, SyscallTable* sc, ULONG64 systemCr3, KernelO
     if (!rootNode) return false;
 
     int spoofed = 0;
-    WalkAndSpoofVAD(device, sc, rootNode, systemCr3, offsets, 0, &spoofed);
+    ULONG64 visited = 0;
+    WalkAndSpoofVAD(device, sc, rootNode, systemCr3, offsets, 0, &spoofed, &visited);
     printf("[+] Spoofed %d VADs\n", spoofed);
+
+    if (spoofed == 0 && WindowResidentChunks() == 0)
+        printf("[-] No window chunk was pre-faulted, the VADs were left untouched\n");
 
     if (spoofed > 0 && offsets->VirtualSize) {
         g_VirtualSizeVA = ourEprocessVA + offsets->VirtualSize;

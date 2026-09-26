@@ -16,4 +16,10 @@ void WindowWriteBuffer(ULONG64 physAddr, void* buffer, ULONG size);
 ULONG64 WindowVirtToPhys(ULONG64 cr3, ULONG64 virtualAddr);
 void RestorePhysWindow();
 
+// Number of VAD fields still patched (diagnostics for the crash reporter).
+ULONG WindowVadPatchCount();
+// Number of window chunks whose pages are all present, i.e. that can safely
+// have their VAD truncated (see PrefaultWindow()).
+ULONG WindowResidentChunks();
+
 bool SpoofWindowVADs(HANDLE device, SyscallTable* sc, ULONG64 systemCr3, KernelOffsets* offsets);

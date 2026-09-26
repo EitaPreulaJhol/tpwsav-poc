@@ -556,7 +556,6 @@ static int RunBody() {
         if (threadTok) CloseHandle(threadTok);
     }
 
-    printf("\n[+] Tpwsav loader complete\n");
     printf("[+] System CR3: 0x%llX\n", systemCr3);
 
     g_Phase = PH_DSE;

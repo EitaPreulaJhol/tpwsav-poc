@@ -115,6 +115,7 @@ struct PdbDownloadInfo {
     GUID guid;
     DWORD age;
     std::string pdbFileName;
+    ULONG imageSize;   // SizeOfImage, used to sanity check resolved RVAs
 };
 
 static bool GetPdbInfo(const char* pePath, PdbDownloadInfo* info) {
@@ -159,6 +160,7 @@ static bool GetPdbInfo(const char* pePath, PdbDownloadInfo* info) {
     info->guid = pdb->guid;
     info->age = pdb->age;
     info->pdbFileName = pdb->pdbFileName;
+    info->imageSize = imageSize;
     return true;
 }
 
@@ -281,29 +283,61 @@ static IDiaDataSource* CreateDiaSource() {
 }
 
 static bool DiaGetGlobalRva(IDiaSession* session, IDiaSymbol* global,
-                            const char* name, ULONG64* rva) {
+                            const char* name, ULONG64* rva, bool dataGlobal) {
     (void)session;
     wchar_t wName[256];
     mbstowcs(wName, name, 256);
 
-    // Try public symbols first, then data symbols. Each tag is attempted even
-    // when the previous one succeeds but returns an empty enumeration.
-    const enum SymTagEnum tags[] = { SymTagPublicSymbol, SymTagData };
-    for (enum SymTagEnum tag : tags) {
+    // A global variable is described by a SymTagData entry; the public symbol
+    // of the same name is only a section/offset pair, and DIA will happily
+    // report a plausible but wrong RVA for it. For data globals, trust the data
+    // symbol and keep the public one as a fallback. Functions are the other way
+    // round. When both resolve and disagree, say so - a silent disagreement is
+    // how a walk ends up reading the PE header instead of a list head.
+    const enum SymTagEnum tags[] = {
+        dataGlobal ? SymTagData : SymTagPublicSymbol,
+        dataGlobal ? SymTagPublicSymbol : SymTagData
+    };
+    const char* tagNames[] = { "data", "public" };
+
+    bool have[2] = { false, false };
+    ULONG64 rvas[2] = { 0, 0 };
+
+    for (int t = 0; t < 2; t++) {
         CComPtr<IDiaEnumSymbols> enumSyms;
-        HRESULT hr = global->findChildren(tag, wName, nsfCaseInsensitive, &enumSyms);
+        HRESULT hr = global->findChildren(tags[t], wName, nsfCaseInsensitive, &enumSyms);
         if (FAILED(hr) || !enumSyms) continue;
 
         CComPtr<IDiaSymbol> sym;
         ULONG celt = 0;
         if (FAILED(enumSyms->Next(1, &sym, &celt)) || celt != 1 || !sym) continue;
 
+        // findChildren matches case-insensitively, so a neighbour like
+        // "PsActiveProcessHeadLock" can come back instead of the exact name.
+        BSTR symName = nullptr;
+        if (SUCCEEDED(sym->get_name(&symName)) && symName) {
+            bool matches = lstrcmpW(symName, wName) == 0;
+            if (!matches)
+                printf("[-] %s: %ls symbol is not '%s', ignoring it\n",
+                       name, (wchar_t*)symName, name);
+            SysFreeString(symName);
+            if (!matches) continue;
+        }
+
         DWORD rvaVal = 0;
         if (FAILED(sym->get_relativeVirtualAddress(&rvaVal))) continue;
+        if (rvaVal == 0) continue; // no section/offset: not a usable address
 
-        *rva = rvaVal;
-        return true;
+        have[t] = true;
+        rvas[t] = rvaVal;
     }
+
+    if (have[0] && have[1] && rvas[0] != rvas[1])
+        printf("[!] %s: %s says 0x%llX but %s says 0x%llX - using %s\n",
+               name, tagNames[0], rvas[0], tagNames[1], rvas[1], tagNames[0]);
+
+    if (have[0]) { *rva = rvas[0]; return true; }
+    if (have[1]) { *rva = rvas[1]; return true; }
 
     printf("[-] symbol not found: %s\n", name);
     return false;
@@ -361,7 +395,7 @@ bool ResolveKernelOffsets(KernelOffsets* offsets) {
     }
     printf("[+] ntoskrnl: 0x%llX\n", offsets->NtoskrnlBase);
 
-    PdbDownloadInfo pdbInfo;
+    PdbDownloadInfo pdbInfo = {};
     if (!GetPdbInfo("C:\\Windows\\System32\\ntoskrnl.exe", &pdbInfo)) {
         printf("[-] Failed to read ntoskrnl debug directory\n");
         return false;
@@ -404,20 +438,22 @@ bool ResolveKernelOffsets(KernelOffsets* offsets) {
     }
 
     bool ok = true;
-    ok &= DiaGetGlobalRva(session, global, "PsActiveProcessHead", &offsets->PsActiveProcessHead);
-    ok &= DiaGetGlobalRva(session, global, "PiDDBCacheTable", &offsets->PiDDBCacheTable);
-    ok &= DiaGetGlobalRva(session, global, "PiDDBCacheList", &offsets->PiDDBCacheList);
-    ok &= DiaGetGlobalRva(session, global, "PiDDBLock", &offsets->PiDDBLock);
-    ok &= DiaGetGlobalRva(session, global, "MmUnloadedDrivers", &offsets->MmUnloadedDrivers);
-    ok &= DiaGetGlobalRva(session, global, "MmLastUnloadedDriver", &offsets->MmLastUnloadedDriver);
-    ok &= DiaGetGlobalRva(session, global, "PsInitialSystemProcess", &offsets->PsInitialSystemProcess);
-    ok &= DiaGetGlobalRva(session, global, "PsLoadedModuleList", &offsets->PsLoadedModuleList);
-    ok &= DiaGetGlobalRva(session, global, "HalpRMStub", &offsets->HalpRMStub);
-    ok &= DiaGetGlobalRva(session, global, "RtlLookupElementGenericTableAvl", &offsets->RtlLookupElementGenericTableAvl);
-    ok &= DiaGetGlobalRva(session, global, "RtlDeleteElementGenericTableAvl", &offsets->RtlDeleteElementGenericTableAvl);
-    ok &= DiaGetGlobalRva(session, global, "ExAcquireResourceExclusiveLite", &offsets->ExAcquireResourceExclusiveLite);
-    ok &= DiaGetGlobalRva(session, global, "ExReleaseResourceLite", &offsets->ExReleaseResourceLite);
-    ok &= DiaGetGlobalRva(session, global, "ExFreePoolWithTag", &offsets->ExFreePoolWithTag);
+    // dataGlobal = true: these are variables, so the SymTagData RVA is the
+    // authoritative one. false: these are functions.
+    ok &= DiaGetGlobalRva(session, global, "PsActiveProcessHead", &offsets->PsActiveProcessHead, true);
+    ok &= DiaGetGlobalRva(session, global, "PiDDBCacheTable", &offsets->PiDDBCacheTable, true);
+    ok &= DiaGetGlobalRva(session, global, "PiDDBCacheList", &offsets->PiDDBCacheList, true);
+    ok &= DiaGetGlobalRva(session, global, "PiDDBLock", &offsets->PiDDBLock, true);
+    ok &= DiaGetGlobalRva(session, global, "MmUnloadedDrivers", &offsets->MmUnloadedDrivers, true);
+    ok &= DiaGetGlobalRva(session, global, "MmLastUnloadedDriver", &offsets->MmLastUnloadedDriver, true);
+    ok &= DiaGetGlobalRva(session, global, "PsInitialSystemProcess", &offsets->PsInitialSystemProcess, true);
+    ok &= DiaGetGlobalRva(session, global, "PsLoadedModuleList", &offsets->PsLoadedModuleList, true);
+    ok &= DiaGetGlobalRva(session, global, "HalpRMStub", &offsets->HalpRMStub, false);
+    ok &= DiaGetGlobalRva(session, global, "RtlLookupElementGenericTableAvl", &offsets->RtlLookupElementGenericTableAvl, false);
+    ok &= DiaGetGlobalRva(session, global, "RtlDeleteElementGenericTableAvl", &offsets->RtlDeleteElementGenericTableAvl, false);
+    ok &= DiaGetGlobalRva(session, global, "ExAcquireResourceExclusiveLite", &offsets->ExAcquireResourceExclusiveLite, false);
+    ok &= DiaGetGlobalRva(session, global, "ExReleaseResourceLite", &offsets->ExReleaseResourceLite, false);
+    ok &= DiaGetGlobalRva(session, global, "ExFreePoolWithTag", &offsets->ExFreePoolWithTag, false);
 
     ok &= DiaGetMemberOffset(global, "_KPROCESS", "DirectoryTableBase", &offsets->DirectoryTableBase);
     ok &= DiaGetMemberOffset(global, "_KPROCESS", "UserDirectoryTableBase", &offsets->UserDirectoryTableBase);
@@ -442,6 +478,37 @@ bool ResolveKernelOffsets(KernelOffsets* offsets) {
 
     if (!DiaGetMemberOffset(global, "_EPROCESS", "VirtualSize", &offsets->VirtualSize))
         offsets->VirtualSize = 0;
+
+    // The member is Token in most PDBs, PrimaryToken in some. Not fatal if it
+    // is missing: the thread-level impersonation still works without it.
+    if (!DiaGetMemberOffset(global, "_EPROCESS", "Token", &offsets->Token) &&
+        !DiaGetMemberOffset(global, "_EPROCESS", "PrimaryToken", &offsets->Token)) {
+        printf("[-] _EPROCESS::Token not found, process-level SYSTEM will be skipped\n");
+        offsets->Token = 0;
+    } else {
+        printf("[+] _EPROCESS::Token        off: 0x%X\n", offsets->Token);
+    }
+
+    // The walks below fail silently on a plausible-but-wrong RVA (they read the
+    // module header and give up), so show the ones that steer them and reject
+    // anything that cannot possibly be inside the image.
+    struct { const char* name; ULONG64 rva; } globals[] = {
+        { "PsActiveProcessHead", offsets->PsActiveProcessHead },
+        { "PsLoadedModuleList",   offsets->PsLoadedModuleList },
+        { "PsInitialSystemProcess", offsets->PsInitialSystemProcess },
+        { "PiDDBCacheList",       offsets->PiDDBCacheList },
+        { "PiDDBCacheTable",      offsets->PiDDBCacheTable },
+        { "MmUnloadedDrivers",    offsets->MmUnloadedDrivers },
+        { "MmLastUnloadedDriver", offsets->MmLastUnloadedDriver },
+    };
+    for (auto& g : globals) {
+        bool inRange = g.rva != 0 && g.rva < pdbInfo.imageSize;
+        printf("[%c] %-22s RVA 0x%llX%s\n", inRange ? '+' : '!', g.name, g.rva,
+               inRange ? "" : "  <-- outside the image, this is garbage");
+        if (!inRange) ok = false;
+    }
+    printf("[+] ntoskrnl SizeOfImage    0x%X\n", pdbInfo.imageSize);
+    printf("[+] VirtualSize           off: 0x%X\n", offsets->VirtualSize);
 
     global.Release();
     session.Release();
@@ -489,7 +556,7 @@ bool ResolveSymbolRva(const char* pePath, const char* symbolName, ULONG64* rva) 
         if (SUCCEEDED(source->openSession(&session))) {
             CComPtr<IDiaSymbol> global;
             if (SUCCEEDED(session->get_globalScope(&global)))
-                ok = DiaGetGlobalRva(session, global, symbolName, rva);
+                ok = DiaGetGlobalRva(session, global, symbolName, rva, true);
         }
     } else {
         printf("[-] Failed to load PDB into DIA\n");

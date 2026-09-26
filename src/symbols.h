@@ -35,6 +35,7 @@ struct KernelOffsets {
     ULONG VadFlags;
 
     ULONG VirtualSize;
+    ULONG Token;           // _EPROCESS::Token, the process primary token object
 
     ULONG64 PsLoadedModuleList;
 

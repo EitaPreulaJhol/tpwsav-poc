@@ -33,3 +33,4 @@ ULONG64 FindSystemCr3(HANDLE device, SyscallTable* sc, ULONG64 ntoskrnlBase);
 // Route PhysRead*/PhysWrite* through the physical memory window instead of the
 // driver's map/unmap IOCTLs. Enabled once SetupPhysWindow has mapped the RAM.
 void SetPhysWindowMode(bool enabled);
+bool PhysWindowModeEnabled();

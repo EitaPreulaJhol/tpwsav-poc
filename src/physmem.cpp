@@ -10,6 +10,10 @@ void SetPhysWindowMode(bool enabled) {
     g_UseWindow = enabled;
 }
 
+bool PhysWindowModeEnabled() {
+    return g_UseWindow;
+}
+
 static NTSTATUS SendIoctl(
     HANDLE device, SyscallTable* sc,
     ULONG code,

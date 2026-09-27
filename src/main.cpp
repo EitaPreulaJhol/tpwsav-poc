@@ -275,40 +275,35 @@ static int RunBody() {
         printf("[+] SeLoadDriverPrivilege enabled\n");
     }
 
-	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide. 
-    // The file is created with FILE_OVERWRITE_IF so that if the same tick count is used twice in a row, the second run will overwrite the first file instead of failing to create it.
+    // The embedded driver is written to %TEMP% under a tick-derived name,
+    // registered by hand through the NT APIs, and deleted again once mapped.
     printf("\n[*] Dropping driver to temp...\n");
     g_Phase = PH_DROP;
 
-	// The temp path is used to avoid any permission issues, and the file is deleted after the driver is loaded.
+	// %TEMP% sidesteps any permission trouble with the working directory.
     wchar_t tempDir[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tempDir);
 
-	// Use the tick count to generate a unique name for the driver file. 
-    // This helps avoid collisions if the tool is run multiple times in quick succession.
+	// The tick count keeps two runs in quick succession from colliding.
     DWORD tick = (DWORD)GetTickCount64();
     wchar_t svcName[32] = {};
     wsprintfW(svcName, L"tmp%X", tick);
 
-	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide.
     wchar_t dropPath[MAX_PATH] = {};
     wsprintfW(dropPath, L"%s%s.sys", tempDir, svcName);
 
-	// The driver bytes are written to the temp file. If the write fails, the tool exits with an error.
     wchar_t ntPath[MAX_PATH] = {};
     wsprintfW(ntPath, L"\\??\\%s", dropPath);
 
-	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide.
     HANDLE fileHandle = NULL;
     IO_STATUS_BLOCK ioStatus = {};
     UNICODE_STRING filePath;
     OBJECT_ATTRIBUTES fileAttrs;
 
-	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide.
     InitUnicodeString(&filePath, ntPath);
     InitializeObjectAttributes(&fileAttrs, &filePath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-	// The file is created with FILE_OVERWRITE_IF so that if the same tick count is used twice in a row, the second run will overwrite the first file instead of failing to create it.
+	// FILE_OVERWRITE_IF so a repeated tick count overwrites rather than fails.
     NTSTATUS status = DoSyscallEx(
         sc.NtCreateFile,
         (ULONG_PTR)&fileHandle,
@@ -324,13 +319,11 @@ static int RunBody() {
         (ULONG_PTR)0
     );
 
-	// The file is created with FILE_OVERWRITE_IF so that if the same tick count is used twice in a row, the second run will overwrite the first file instead of failing to create it.
     if (status != 0) {
         printf("[-] Failed to create temp file: 0x%lX\n", status);
         return 1;
     }
 
-	// The driver bytes are written to the temp file. If the write fails, the tool exits with an error.
     ioStatus = {};
     status = DoSyscallEx(
         sc.NtWriteFile,
@@ -354,24 +347,21 @@ static int RunBody() {
         return 1;
     }
 
-	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide.
     printf("[+] Dropped %u bytes\n", g_DriverSize);
 
-	// The service registry key is created for the driver.
     printf("\n[*] Creating service registry key...\n");
     UNICODE_STRING keyPath;
     wchar_t svcRegPath[MAX_PATH] = {};
     wsprintfW(svcRegPath, L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\%s", svcName);
     InitUnicodeString(&keyPath, svcRegPath);
 
-	// The service registry key is created for the driver.
+    // The service key needs exactly two values: ImagePath and Type.
     OBJECT_ATTRIBUTES keyAttrs;
     InitializeObjectAttributes(&keyAttrs, &keyPath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
     HANDLE keyHandle = NULL;
     ULONG disposition = 0;
 
-	// The service registry key that is created for the driver.
     status = DoSyscallEx(
         sc.NtCreateKey,
         (ULONG_PTR)&keyHandle,
@@ -392,7 +382,6 @@ static int RunBody() {
     UNICODE_STRING imagePathName;
     InitUnicodeString(&imagePathName, L"ImagePath");
 
-	// The ImagePath value is set to the path of the driver file.
     status = DoSyscallEx(
         sc.NtSetValueKey,
         (ULONG_PTR)keyHandle,
@@ -432,7 +421,6 @@ static int RunBody() {
         return 1;
     }
 
-	// The service registry key is created for the driver.
     printf("[+] Service key created\n");
 
 	// The driver is loaded using NtLoadDriver. 
@@ -543,7 +531,7 @@ static int RunBody() {
     if (mmPrepared && status == 0)
         FinishMmCleanup(&mmCtx);
 
-	// The service registry key is deleted after the driver is unloaded.
+	// The service key goes too, once the driver is unloaded.
     InitializeObjectAttributes(&keyAttrs, &keyPath, OBJ_CASE_INSENSITIVE, NULL, NULL);
     status = DoSyscallEx(
         sc.NtCreateKey,

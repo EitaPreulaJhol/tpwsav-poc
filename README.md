@@ -75,7 +75,7 @@ what the rest of the tool is built on.
 
 ## Status
 
-Verified on Windows 11 26100, with and without HVCI:
+Verified on Windows 11 26200.9550 and 26100.9457, with and without HVCI:
 
 | | |
 |---|---|

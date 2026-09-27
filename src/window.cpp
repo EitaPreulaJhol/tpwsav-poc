@@ -86,6 +86,15 @@ BOOL WindowContains(ULONG64 physAddr) {
     return ResolvePhysAddr(physAddr) != NULL;
 }
 
+ULONG64 WindowResidentExtent() {
+    ULONG64 end = 0;
+    for (ULONG i = 0; i < g_ChunkCount; i++) {
+        if (!g_Chunks[i].mappedAddr || !g_Chunks[i].resident) break;
+        end = g_Chunks[i].physBase + g_Chunks[i].mapSize;
+    }
+    return end;
+}
+
 // Read a kernel pointer, saying out loud why it failed.
 //
 // This exists because WindowRead64() answers 0 for both "the value is 0" and
@@ -155,10 +164,19 @@ static void PrefaultWindow() {
         haveBudget = true;
     }
 
-    // The DSE phase afterwards downloads a PDB and runs DIA over it, so keep a
-    // real margin instead of running the process right up against the limit.
+    // The DSE phase afterwards downloads a PDB and runs DIA over it, and the
+    // memory sweep needs room too, so keep a real margin instead of running the
+    // process right up against the limit. The cap keeps a long tail of commit
+    // free even on a machine with plenty of RAM: the VAD spoof only needs a
+    // *prefix* of the window, so a smaller prefix costs nothing but a smaller
+    // hidden area.
     const ULONGLONG slack = 1024ULL << 20;
+    const ULONGLONG cap = 2ULL << 30;
     ULONGLONG budget = (available > slack) ? available - slack : 0;
+    if (budget > cap) {
+        budget = cap;
+        printf("[*] Capping the pre-fault at %llu MB to leave commit headroom\n", budget >> 20);
+    }
 
     ULONGLONG t0 = GetTickCount64();
     printf("[*] Pre-faulting window (%llu MB total, %llu MB commit available)...\n",
@@ -195,7 +213,7 @@ static void PrefaultWindow() {
         // Confirm the mapping is writable while a page fault can still be taken.
         for (ULONGLONG off = 0; off < c->mapSize; off += kProbeStride) {
             if (!ProbeWindowWrite(c->mappedAddr + off)) {
-                printf("[-] Chunk %u is not writable, leaving it unspoofed\n", i);
+                printf("[-] Chunk %u is not writable, leaving it unspoofed\n\n", i);
                 ok = false;
                 break;
             }

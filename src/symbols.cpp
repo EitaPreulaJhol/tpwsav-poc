@@ -63,10 +63,8 @@ static bool EnablePrivilege(LPCWSTR name) {
 
 static ULONG64 GetKernelBase() {
     // SystemModuleInformation returns an empty module list unless
-    // SeDebugPrivilege is *enabled*. An elevated token has the privilege
-    // present but disabled, so relying on the token alone is not enough: it
-    // happened to work from an admin terminal (which had it enabled) but
-    // failed when the exe was started by double-click.
+    // SeDebugPrivilege is *enabled*, and an elevated token has it present but
+    // disabled - so relying on the token alone fails when double-clicked.
     EnablePrivilege(SE_DEBUG_NAME);
 
     auto NtQSI = (pNtQuerySystemInformation)
@@ -288,12 +286,11 @@ static bool DiaGetGlobalRva(IDiaSession* session, IDiaSymbol* global,
     wchar_t wName[256];
     mbstowcs(wName, name, 256);
 
-    // A global variable is described by a SymTagData entry; the public symbol
-    // of the same name is only a section/offset pair, and DIA will happily
-    // report a plausible but wrong RVA for it. For data globals, trust the data
-    // symbol and keep the public one as a fallback. Functions are the other way
-    // round. When both resolve and disagree, say so - a silent disagreement is
-    // how a walk ends up reading the PE header instead of a list head.
+    // A global variable is described by a SymTagData entry; a public symbol of
+    // the same name is only a section/offset pair and DIA will report a
+    // plausible but wrong RVA for it. So data globals prefer the data symbol,
+    // functions the public one. A disagreement is announced - silently picking
+    // the wrong one is how a walk ends up reading the PE header.
     const enum SymTagEnum tags[] = {
         dataGlobal ? SymTagData : SymTagPublicSymbol,
         dataGlobal ? SymTagPublicSymbol : SymTagData

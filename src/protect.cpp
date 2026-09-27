@@ -111,6 +111,9 @@ static DWORD FindWinlogonPid() {
     return 0;
 }
 
+// Impersonate SYSTEM on this thread. Note this changes only the thread's
+// effective token - the process identity is fixed separately by swapping
+// EPROCESS::Token in window.cpp.
 bool ImpersonateSystem() {
     DWORD pid = FindWinlogonPid();
     if (!pid) return false;
@@ -141,6 +144,9 @@ bool ImpersonateSystem() {
     return result;
 }
 
+// Lock the process object down: a DENY for Everyone plus a GRANT for SYSTEM, so
+// the process can only be opened by a sufficiently privileged one. Applied last,
+// since it also denies *us* write access to our own process object.
 bool LockProcessDACL() {
     SID_IDENTIFIER_AUTHORITY worldAuth = SECURITY_WORLD_SID_AUTHORITY;
     SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;

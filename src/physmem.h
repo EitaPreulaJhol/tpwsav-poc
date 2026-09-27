@@ -2,6 +2,9 @@
 #include <windows.h>
 #include "syscalls.h"
 
+// Driver IOCTLs: map / unmap a physical page. The handle used here comes from a
+// leak the driver exposes on its first IOCTL, which is what makes the whole
+// window approach possible without a working driver.
 #define IOCTL_MAP_PHYS   0x0022E008
 #define IOCTL_UNMAP_PHYS 0x0022E00C
 

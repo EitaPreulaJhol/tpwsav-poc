@@ -95,15 +95,10 @@ ULONG64 WindowResidentExtent() {
     return end;
 }
 
-// Read a kernel pointer, saying out loud why it failed.
-//
-// This exists because WindowRead64() answers 0 for both "the value is 0" and
-// "this address is not readable", and a linked-list walk treats a 0 Flink as
-// the end of the list. That is how the EPROCESS and PiDDB walks both stopped
-// short without saying anything.
-//
-// A window page that was never faulted in can also fail its first access, so a
-// 0 is retried once after forcing the page in.
+// Read a kernel pointer, reporting why it failed instead of returning a 0 that
+// a list walk would mistake for the end of the list. A window page that was
+// never faulted in can also fail its first access, so a 0 is retried once after
+// forcing the page in.
 ULONG64 WindowReadKernelPtr(ULONG64 cr3, ULONG64 va, const char* what) {
     ULONG64 pa = WindowVirtToPhys(cr3, va);
     if (!pa) {
@@ -131,22 +126,15 @@ ULONG64 WindowReadKernelPtr(ULONG64 cr3, ULONG64 va, const char* what) {
 
 // Pre-fault the whole window before any VAD is spoofed.
 //
-// This is the hard requirement for the VAD spoof to be survivable. Truncating a
-// VAD does not stop the kernel from keeping the section mapped, but it *does*
-// remove the address range from the VAD tree, and a user-mode page fault is
-// resolved through that tree: MiFindVad() finds nothing past the new end and
-// the access comes back as STATUS_ACCESS_VIOLATION. The first physical read
-// more than 64 KiB into a 1 GiB chunk after the spoof therefore kills the
-// process - silently, because nothing in the tool has a handler there.
-//
-// Faulting every page in first makes the view need no further faults, so the
-// truncated VADs only cost visibility (VirtualQuery) and nothing else.
+// Truncating a VAD does not stop the kernel keeping the section mapped, but it
+// does remove the range from the VAD tree, and a user fault is resolved through
+// that tree: past the new end MiFindVad() finds nothing and the access returns
+// STATUS_ACCESS_VIOLATION. Faulting everything in first means no later access
+// faults at all, so truncated VADs cost visibility only.
 //
 // The touch is a read, never a write: these are live physical pages (kernel
-// images, pools, DMA targets) and writing a byte back could clobber a
-// concurrent update. Reads leave the contents untouched. A section-mapped
-// physical page gets a present, section-writable PTE on a read fault, so the
-// later WindowWrite* calls still work; ProbeWindowWrite() samples that.
+// images, pools, DMA targets) that a write-back could clobber. A read fault
+// still installs a section-writable PTE, which ProbeWindowWrite() samples.
 static void PrefaultWindow() {
     ULONGLONG want = 0;
     for (ULONG i = 0; i < g_ChunkCount; i++)
@@ -276,12 +264,10 @@ struct PhysMemDescriptor { ULONG NumberOfRanges; struct PhysMemRange Range[1]; }
 // Highest physical address the guest actually owns.
 //
 // GetPhysicallyInstalledSystemMemory() reports *installed* RAM, which is not the
-// same as the top of the physical address space once memory has been added after
-// boot (VM hot-add / dynamic memory). The page tables happily map frames above
-// the installed total - a walk that lands on one of those returns a physical
-// address the window does not cover, and a linked-list read of it comes back as
-// 0, which silently truncates the walk. Ask the kernel for the real ranges and
-// take whichever answer is larger.
+// top of the address space once memory is hot-added (VM dynamic memory). The
+// page tables map frames above the installed total anyway, and reading one of
+// those returns 0 - which silently truncates a linked-list walk rather than
+// looking like a failure. Ask for the real ranges and take the larger answer.
 static ULONG64 PhysicalMemoryLimit(ULONG64 installedBytes) {
     typedef NTSTATUS(WINAPI* pNtQSI)(ULONG, PVOID, ULONG, PULONG);
     auto NtQSI = (pNtQSI)GetProcAddress(GetModuleHandleA("ntdll.dll"),
@@ -584,16 +570,12 @@ static void WalkAndSpoofVAD(
         ULONG64 regionStart = (ULONG64)startVpn << 12;
         ULONG64 regionSize = ((ULONG64)endVpn - startVpn + 1) << 12;
 
-        // How much of this VAD can be hidden. A window chunk that is not
-        // resident still needs its VAD range, because the next read from it
-        // has to take a page fault - and past the cut there is no VAD left to
-        // resolve that fault, so the read comes back as STATUS_ACCESS_VIOLATION
-        // and kills the process. So the cut stops in front of the first chunk
-        // that was not pre-faulted, and everything below it may go.
-        //
-        // Taking the minimum over every chunk in the region (instead of trusting
-        // the VAs to be in order) keeps the cut safe either way: at worst it
-        // hides less than it could.
+        // How much of this VAD can be hidden. A chunk that is not resident still
+        // needs its VAD range, because reading it must fault and there is no VAD
+        // left past the cut to resolve that fault. So the cut stops in front of
+        // the first non-resident chunk. Taking the minimum over all chunks in the
+        // region (rather than trusting the VAs to be ordered) is safe either way:
+        // at worst it hides less than it could.
         ULONG64 cutVA = regionStart + regionSize;
         bool covers = false;
         for (ULONG i = 0; i < g_ChunkCount; i++) {
@@ -669,10 +651,9 @@ recurse:
 }
 
 // Walk PsActiveProcessHead and return the EPROCESS that belongs to targetPid.
-// The list is a circular doubly-linked list of LIST_ENTRYs embedded in each
-// EPROCESS, so following Flink must come back to the head after visiting every
-// process. Dying after a handful of entries means the head RVA is wrong, not
-// that the system has three processes.
+// The list is circular, with a LIST_ENTRY embedded in each EPROCESS, so Flink
+// must return to the head after every process. Dying after a handful of entries
+// means the head RVA is wrong, not that the system has three processes.
 static bool FindEprocessByPid(ULONG64 cr3, KernelOffsets* offsets, ULONG64 listHeadVA,
                               DWORD targetPid, bool verbose, int* walked,
                               ULONG64* outEprocVA) {
@@ -710,14 +691,12 @@ static bool FindEprocessByPid(ULONG64 cr3, KernelOffsets* offsets, ULONG64 listH
     return false;
 }
 
-// Recover the EPROCESS list head without the PDB.
-//
-// PsInitialSystemProcess points at a known EPROCESS (the System process, always
-// PID 4), and that EPROCESS embeds one of the list's LIST_ENTRYs. Following
-// Blink from it walks the list backwards until reaching the head, which is the
-// one node whose Blink points back at the node we arrived from. The result is
-// only handed to the caller if a walk from it actually finds our own PID, so a
-// wrong offset cannot turn into a wrong walk.
+// Recover the EPROCESS list head without trusting the PDB RVA.
+// PsInitialSystemProcess is a known EPROCESS (System, always PID 4) embedding
+// one of the list's LIST_ENTRYs. Following Blink walks the list backwards to the
+// head, which is the one node whose Blink points back where we came from. The
+// result is only used if a walk from it actually finds the target PID, so a
+// wrong offset cannot become a wrong walk.
 static bool RecoverEprocessListHead(ULONG64 systemCr3, KernelOffsets* offsets,
                                     DWORD ourPid, ULONG64* outHeadVA) {
     if (!offsets->PsInitialSystemProcess) return false;

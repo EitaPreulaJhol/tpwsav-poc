@@ -2,10 +2,9 @@
 #include <windows.h>
 #include "symbols.h"
 
-// Resolve ci.dll!g_CiOptions' RVA, which means downloading that module's PDB and
-// running DIA over it. That is by far the most memory-hungry thing the loader
-// does, so it happens up front - before the physical window commits a couple of
-// gigabytes - and DisableDSE() is then only a translate and a write.
+// Resolve ci.dll!g_CiOptions' RVA: download that PDB and run DIA over it.
+// Done up front, because it is the most memory-hungry step here, so DisableDSE()
+// is left with just a translate and a write.
 bool ResolveCiOptionsRva(ULONG64* outRva);
 
 // Zeroes ci.dll!g_CiOptions through the physical window (no driver, no ring0

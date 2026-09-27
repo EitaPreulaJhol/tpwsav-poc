@@ -55,17 +55,11 @@ bool WindowSetProcessPpl(ULONG64 systemCr3, KernelOffsets* offsets,
                          ULONG64 eprocVA, BYTE level);
 
 // Make the *process* run as SYSTEM, not just this thread.
-//
-// SetThreadToken() only changes the thread's effective token: API calls made
-// from this thread are checked as SYSTEM, but the process still carries the
-// elevated admin token as its primary token, so anything that looks at the
-// process (Task Manager, Process Explorer, a new child process, an audit log)
-// still sees the original account. Swapping EPROCESS::Token for the System
-// process's own token fixes the process identity itself.
-//
-// The System process holds a reference to that token for as long as it runs, so
-// the borrowed token cannot be freed underneath us. The write is read back and
-// the caller is told either way.
+// SetThreadToken() only changes the thread's effective token, so anything that
+// looks at the process itself (Task Manager, a child process, an audit log) still
+// sees the original account. Swapping EPROCESS::Token fixes the identity. The
+// System process holds a reference to that token for as long as it runs, so the
+// borrowed one cannot be freed underneath us; the write is read back.
 bool SetProcessSystemToken(ULONG64 systemCr3, KernelOffsets* offsets);
 
 bool SpoofWindowVADs(HANDLE device, SyscallTable* sc, ULONG64 systemCr3, KernelOffsets* offsets);

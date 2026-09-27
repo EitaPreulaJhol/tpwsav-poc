@@ -179,10 +179,9 @@ bool PrepareMmCleanup(
 
     ctx->preUnloadIndex = PhysRead32(device, sc, lastIndexPA);
 
-    // Scan the whole ring instead of trusting MmLastUnloadedDriver. Two reasons:
-    // the write/advance order is a kernel detail we have already mis-guessed
-    // once, and - more usefully - a scan proves whether the address even *is* a
-    // 50-entry ring. Picking a slot by index on a wrong base produces a
+    // Scan the whole ring rather than trusting MmLastUnloadedDriver: the
+    // write/advance order is a kernel detail, and a scan also proves whether the
+    // address is a 50-entry ring at all. Indexing a wrong base yields a
     // plausible-looking entry that is not one, which is how a wrong RVA becomes
     // a write into unrelated kernel memory.
     const ULONG kSlots = 50;
@@ -236,10 +235,9 @@ bool PrepareMmCleanup(
            emptyCount, namedCount, unreadableCount, oursCount);
 
     if (oursCount == 0) {
-        // The ring is real - the populated slot count tracks the ring index - so
-        // what is wrong is which word inside a slot holds the name. Rather than
-        // guessing offsets from a published struct definition, test each 8-byte
-        // word and keep the one that points at a readable path naming our driver.
+        // No slot named our driver with the assumed layout, so find which word of
+        // a slot holds the name by testing each 8-byte word as a pointer to a
+        // readable path, rather than guessing an offset from the published struct.
         MmProbe hits[64];
         int hitCount = 0;
         MmProbe* firstHit = NULL;

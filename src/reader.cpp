@@ -7,6 +7,8 @@
 #include "window.h"
 #include "reader.h"
 
+// Scan [startPage, endPage) for a CR3 that maps both target VAs. Every read is
+// SEH-guarded because a candidate page can be anything at all.
 static void ScanCr3Worker(
     ULONG64 startPage, ULONG64 endPage,
     ULONG64 targetVA, ULONG64 secondVA, ULONG64 totalPages,
@@ -84,6 +86,8 @@ static void ScanCr3Worker(
     }
 }
 
+// Sweep physical memory in parallel, one thread per hardware thread, for a page
+// table that maps two known VAs. A second VA rules out a coincidental match.
 static ULONG64 BruteForceCr3(ULONG64 targetVA, ULONG64 secondVA) {
     ULONGLONG installedKB = 0;
     GetPhysicallyInstalledSystemMemory(&installedKB);
@@ -111,6 +115,8 @@ static ULONG64 BruteForceCr3(ULONG64 targetVA, ULONG64 secondVA) {
     return foundCr3.load();
 }
 
+// Demo only: cross-process read of another process's PE header. Not called by
+// the loader path.
 void DemoReadProcess(ULONG64 systemCr3, KernelOffsets* offsets) {
     printf("\n[*] Demo: cross-process read\n");
     printf("[*] Looking for notepad.exe...\n");

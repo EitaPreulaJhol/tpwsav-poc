@@ -49,7 +49,7 @@ Basically, here's the detailed overview of what the final .exe does:
 13. **Disable DSE** by zeroing `ci.dll!g_CiOptions`.
 14. **Lock the process DACL** (deny Everyone, grant SYSTEM) as the last step.
 
-## How the vulnerable is loaded
+## How the vulnerable driver is loaded
 
 All of this goes through the raw NT syscalls resolved at startup, not through `advapi32`.
 
